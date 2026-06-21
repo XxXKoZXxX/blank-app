@@ -1,526 +1,616 @@
-"""Tests for streamlit_app.py — music video creator app."""
+"""
+Tests for streamlit_app.py — Music Video Studio
+
+Covers all functions and constants added in this PR:
+  - Constants: MODEL, VISUAL_STYLES, MOOD_OPTIONS, SYSTEM_PROMPT, SCENE_PROMPT
+  - build_markdown_export()
+  - build_prompts_export()
+  - generate_scenes()
+  - get_client()
+  - scene_card()
+  - render_storyboard()
+"""
 
 import json
 import os
 import sys
+import types
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch, call
 
 
 # ---------------------------------------------------------------------------
-# Stub out streamlit and anthropic before importing the app module so tests
-# can run without a running Streamlit server or a real API key.
+# Bootstrap a minimal streamlit stub so we can import streamlit_app without
+# a running Streamlit server.
 # ---------------------------------------------------------------------------
-_st_stub = MagicMock()
-_st_stub.session_state = {}
+
+def _make_st_stub():
+    st = types.ModuleType("streamlit")
+
+    st.session_state = {}
+
+    for name in (
+        "markdown", "title", "caption", "header", "subheader", "divider",
+        "info", "error", "success", "spinner", "expander", "code",
+        "text_input", "text_area", "selectbox", "button", "download_button",
+        "metric", "set_page_config", "tabs", "columns", "sidebar",
+    ):
+        setattr(st, name, MagicMock())
+
+    col1, col2, col3 = MagicMock(), MagicMock(), MagicMock()
+    for c in (col1, col2, col3):
+        c.__enter__ = MagicMock(return_value=c)
+        c.__exit__ = MagicMock(return_value=False)
+        c.metric = MagicMock()
+    st.columns.return_value = [col1, col2]
+
+    for attr in ("spinner", "expander", "sidebar"):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        setattr(st, attr, MagicMock(return_value=cm))
+
+    def _tabs(labels):
+        tabs = []
+        for _ in labels:
+            t = MagicMock()
+            t.__enter__ = MagicMock(return_value=t)
+            t.__exit__ = MagicMock(return_value=False)
+            tabs.append(t)
+        return tabs
+
+    st.tabs = MagicMock(side_effect=_tabs)
+
+    return st
+
+
+_st_stub = _make_st_stub()
 sys.modules["streamlit"] = _st_stub
+sys.modules["anthropic"] = MagicMock()
 
-_anthropic_stub = MagicMock()
-sys.modules["anthropic"] = _anthropic_stub
+import streamlit_app  # noqa: E402
 
 
-import streamlit_app  # noqa: E402  (import after stub)
+def _reset_session():
+    _st_stub.session_state.clear()
 
 
 # ---------------------------------------------------------------------------
-# Helpers / fixtures
+# Shared fixtures
 # ---------------------------------------------------------------------------
 
-def _make_scene(
-    section="Verse 1",
-    lyrics="I can't feel my face when I'm with you",
-    narrative="A lone figure walks through neon-lit streets.",
-    visual="Wide shot of rain-slicked pavement reflecting city lights.",
-    camera="Slow push-in from wide to medium",
-    color_mood="Deep indigo, electric gold, midnight black",
-    image_prompt="Cinematic photorealistic wide shot, neon city night",
-    transition="cut",
-    duration_sec=16,
-):
-    return {
-        "section": section,
-        "lyrics": lyrics,
-        "narrative": narrative,
-        "visual": visual,
-        "camera": camera,
-        "color_mood": color_mood,
-        "image_prompt": image_prompt,
-        "transition": transition,
-        "duration_sec": duration_sec,
+SAMPLE_META = {
+    "title": "Blinding Lights",
+    "artist": "The Weeknd",
+    "mood": "Euphoric & Uplifting",
+    "style": "Neon Cyberpunk",
+}
+
+SAMPLE_SCENES = [
+    {
+        "section": "Verse 1",
+        "lyrics": "I've been tryna call",
+        "narrative": "The protagonist wanders through empty streets.",
+        "visual": "Rain-soaked pavement, neon reflections.",
+        "camera": "Slow tracking shot",
+        "color_mood": "Neon pink and blue",
+        "image_prompt": "cinematic neon rain street",
+        "transition": "cut",
+        "duration_sec": 20,
+    },
+    {
+        "section": "Chorus",
+        "lyrics": "I'm blinded by the lights",
+        "narrative": "An explosion of colour fills the frame.",
+        "visual": "Bright stadium lights, crowd silhouettes.",
+        "camera": "Wide aerial shot",
+        "color_mood": "Blinding white and gold",
+        "image_prompt": "stadium aerial cinematic",
+        "transition": "fade",
+        "duration_sec": 30,
+    },
+]
+
+VALID_SCENES_JSON = json.dumps([
+    {
+        "section": "Verse 1",
+        "lyrics": "line one",
+        "narrative": "story",
+        "visual": "visuals",
+        "camera": "wide shot",
+        "color_mood": "blue",
+        "image_prompt": "prompt here",
+        "transition": "cut",
+        "duration_sec": 16,
     }
+])
 
-
-def _make_meta(title="Blinding Lights", artist="The Weeknd", mood="Energetic & Hype", style="Neon Cyberpunk"):
-    return {"title": title, "artist": artist, "mood": mood, "style": style}
-
-
-# ===========================================================================
-# Constants
-# ===========================================================================
-
-class TestConstants(unittest.TestCase):
-    def test_model_constant_is_string(self):
-        self.assertIsInstance(streamlit_app.MODEL, str)
-        self.assertTrue(streamlit_app.MODEL, "MODEL should be non-empty")
-
-    def test_visual_styles_is_non_empty_list(self):
-        self.assertIsInstance(streamlit_app.VISUAL_STYLES, list)
-        self.assertGreater(len(streamlit_app.VISUAL_STYLES), 0)
-
-    def test_visual_styles_all_strings(self):
-        for item in streamlit_app.VISUAL_STYLES:
-            self.assertIsInstance(item, str)
-
-    def test_mood_options_is_non_empty_list(self):
-        self.assertIsInstance(streamlit_app.MOOD_OPTIONS, list)
-        self.assertGreater(len(streamlit_app.MOOD_OPTIONS), 0)
-
-    def test_mood_options_all_strings(self):
-        for item in streamlit_app.MOOD_OPTIONS:
-            self.assertIsInstance(item, str)
-
-    def test_system_prompt_is_non_empty_string(self):
-        self.assertIsInstance(streamlit_app.SYSTEM_PROMPT, str)
-        self.assertGreater(len(streamlit_app.SYSTEM_PROMPT), 0)
-
-    def test_scene_prompt_contains_format_placeholders(self):
-        prompt = streamlit_app.SCENE_PROMPT
-        for placeholder in ("{title}", "{artist}", "{mood}", "{style}", "{colors}", "{lyrics}"):
-            self.assertIn(placeholder, prompt, f"Missing placeholder: {placeholder}")
-
-    def test_visual_styles_includes_expected_genres(self):
-        """Spot-check a few expected visual style options."""
-        self.assertIn("Cinematic Realism", streamlit_app.VISUAL_STYLES)
-        self.assertIn("Neon Cyberpunk", streamlit_app.VISUAL_STYLES)
-
-    def test_mood_options_includes_expected_moods(self):
-        """Spot-check a few expected mood options."""
-        self.assertIn("Euphoric & Uplifting", streamlit_app.MOOD_OPTIONS)
-        self.assertIn("Melancholic & Sad", streamlit_app.MOOD_OPTIONS)
-
-
-# ===========================================================================
-# build_markdown_export
-# ===========================================================================
-
-class TestBuildMarkdownExport(unittest.TestCase):
-    def test_header_contains_title_and_artist(self):
-        meta = _make_meta(title="Neon Dreams", artist="Synth Wave")
-        result = streamlit_app.build_markdown_export(meta, [])
-        self.assertIn("Neon Dreams", result)
-        self.assertIn("Synth Wave", result)
-
-    def test_header_contains_style_and_mood(self):
-        meta = _make_meta(style="Vintage Film Grain", mood="Nostalgic & Reflective")
-        result = streamlit_app.build_markdown_export(meta, [])
-        self.assertIn("Vintage Film Grain", result)
-        self.assertIn("Nostalgic & Reflective", result)
-
-    def test_empty_scenes_returns_just_header(self):
-        meta = _make_meta()
-        result = streamlit_app.build_markdown_export(meta, [])
-        self.assertIsInstance(result, str)
-        self.assertNotIn("## Scene", result)
-
-    def test_single_scene_included(self):
-        meta = _make_meta()
-        scene = _make_scene(section="Chorus", lyrics="I feel it coming", duration_sec=20)
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn("## Scene 1: Chorus", result)
-        self.assertIn("I feel it coming", result)
-        self.assertIn("20s", result)
-
-    def test_multiple_scenes_numbered_correctly(self):
-        meta = _make_meta()
-        scenes = [
-            _make_scene(section="Verse 1"),
-            _make_scene(section="Chorus"),
-            _make_scene(section="Bridge"),
-        ]
-        result = streamlit_app.build_markdown_export(meta, scenes)
-        self.assertIn("## Scene 1: Verse 1", result)
-        self.assertIn("## Scene 2: Chorus", result)
-        self.assertIn("## Scene 3: Bridge", result)
-
-    def test_image_prompt_in_code_block(self):
-        meta = _make_meta()
-        scene = _make_scene(image_prompt="cinematic, slow motion, golden hour")
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn("```\ncinematic, slow motion, golden hour\n```", result)
-
-    def test_camera_and_transition_present(self):
-        meta = _make_meta()
-        scene = _make_scene(camera="aerial tracking shot", transition="dissolve")
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn("aerial tracking shot", result)
-        self.assertIn("dissolve", result)
-
-    def test_missing_meta_keys_use_defaults(self):
-        """Missing keys in meta dict should not raise and fall back to empty string."""
-        result = streamlit_app.build_markdown_export({}, [])
-        self.assertIn("Music Video", result)
-
-    def test_missing_scene_keys_use_defaults(self):
-        """A scene with only partial keys should not raise."""
-        meta = _make_meta()
-        result = streamlit_app.build_markdown_export(meta, [{}])
-        self.assertIn("## Scene 1:", result)
-        self.assertIn("cut", result)
-
-    def test_duration_zero_when_missing(self):
-        meta = _make_meta()
-        result = streamlit_app.build_markdown_export(meta, [{}])
-        self.assertIn("0s", result)
-
-    def test_returns_string_type(self):
-        meta = _make_meta()
-        result = streamlit_app.build_markdown_export(meta, [_make_scene()])
-        self.assertIsInstance(result, str)
-
-    def test_scene_lyrics_wrapped_in_quotes(self):
-        meta = _make_meta()
-        scene = _make_scene(lyrics="test lyrics here")
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn('"test lyrics here"', result)
-
-    def test_narrative_present(self):
-        meta = _make_meta()
-        scene = _make_scene(narrative="The hero awakens from a dream.")
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn("The hero awakens from a dream.", result)
-
-
-# ===========================================================================
-# build_prompts_export
-# ===========================================================================
-
-class TestBuildPromptsExport(unittest.TestCase):
-    def test_empty_scenes_returns_empty_string(self):
-        result = streamlit_app.build_prompts_export([])
-        self.assertEqual(result, "")
-
-    def test_single_scene_format(self):
-        scene = _make_scene(section="Intro", image_prompt="dark alley, neon rain")
-        result = streamlit_app.build_prompts_export([scene])
-        self.assertIn("Scene 1 — Intro:", result)
-        self.assertIn("dark alley, neon rain", result)
-
-    def test_multiple_scenes_separated_by_divider(self):
-        scenes = [
-            _make_scene(section="Verse 1", image_prompt="prompt one"),
-            _make_scene(section="Chorus", image_prompt="prompt two"),
-        ]
-        result = streamlit_app.build_prompts_export(scenes)
-        self.assertIn("Scene 1 — Verse 1:", result)
-        self.assertIn("Scene 2 — Chorus:", result)
-        self.assertIn("\n\n---\n\n", result)
-
-    def test_three_scenes_two_dividers(self):
-        scenes = [_make_scene() for _ in range(3)]
-        result = streamlit_app.build_prompts_export(scenes)
-        self.assertEqual(result.count("\n\n---\n\n"), 2)
-
-    def test_missing_section_uses_empty_string(self):
-        result = streamlit_app.build_prompts_export([{}])
-        self.assertIn("Scene 1 — :", result)
-
-    def test_missing_image_prompt_uses_empty_string(self):
-        result = streamlit_app.build_prompts_export([{"section": "Outro"}])
-        self.assertIn("Scene 1 — Outro:", result)
-        self.assertIn("Scene 1 — Outro:\n", result)
-
-    def test_returns_string_type(self):
-        result = streamlit_app.build_prompts_export([_make_scene()])
-        self.assertIsInstance(result, str)
-
-    def test_scene_numbering_starts_at_one(self):
-        scenes = [_make_scene(section=f"S{i}") for i in range(5)]
-        result = streamlit_app.build_prompts_export(scenes)
-        for n in range(1, 6):
-            self.assertIn(f"Scene {n} —", result)
-
-
-# ===========================================================================
-# generate_scenes — JSON parsing logic
-# ===========================================================================
 
 def _make_mock_response(text):
-    """Create a mock Anthropic API response with the given text."""
-    content_block = MagicMock()
-    content_block.text = text
+    block = MagicMock()
+    block.text = text
     response = MagicMock()
-    response.content = [content_block]
+    response.content = [block]
     return response
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+class TestConstants(unittest.TestCase):
+    def test_model_name(self):
+        self.assertEqual(streamlit_app.MODEL, "claude-opus-4-8")
+
+    def test_visual_styles_count(self):
+        self.assertEqual(len(streamlit_app.VISUAL_STYLES), 10)
+
+    def test_visual_styles_are_strings(self):
+        for s in streamlit_app.VISUAL_STYLES:
+            self.assertIsInstance(s, str)
+            self.assertTrue(s.strip())
+
+    def test_visual_styles_contains_expected(self):
+        self.assertIn("Cinematic Realism", streamlit_app.VISUAL_STYLES)
+        self.assertIn("Neon Cyberpunk", streamlit_app.VISUAL_STYLES)
+        self.assertIn("Vintage Film Grain", streamlit_app.VISUAL_STYLES)
+
+    def test_visual_styles_no_duplicates(self):
+        self.assertEqual(len(streamlit_app.VISUAL_STYLES), len(set(streamlit_app.VISUAL_STYLES)))
+
+    def test_mood_options_count(self):
+        self.assertEqual(len(streamlit_app.MOOD_OPTIONS), 10)
+
+    def test_mood_options_are_strings(self):
+        for m in streamlit_app.MOOD_OPTIONS:
+            self.assertIsInstance(m, str)
+            self.assertTrue(m.strip())
+
+    def test_mood_options_contains_expected(self):
+        self.assertIn("Euphoric & Uplifting", streamlit_app.MOOD_OPTIONS)
+        self.assertIn("Melancholic & Sad", streamlit_app.MOOD_OPTIONS)
+        self.assertIn("Chaotic & Frenetic", streamlit_app.MOOD_OPTIONS)
+
+    def test_mood_options_no_duplicates(self):
+        self.assertEqual(len(streamlit_app.MOOD_OPTIONS), len(set(streamlit_app.MOOD_OPTIONS)))
+
+    def test_system_prompt_non_empty(self):
+        self.assertTrue(streamlit_app.SYSTEM_PROMPT.strip())
+
+    def test_system_prompt_mentions_director(self):
+        self.assertIn("director", streamlit_app.SYSTEM_PROMPT.lower())
+
+    def test_scene_prompt_has_all_placeholders(self):
+        for key in ("{title}", "{artist}", "{mood}", "{style}", "{colors}", "{lyrics}"):
+            self.assertIn(key, streamlit_app.SCENE_PROMPT)
+
+    def test_scene_prompt_format_substitution(self):
+        result = streamlit_app.SCENE_PROMPT.format(
+            title="My Song", artist="Artist", lyrics="Some lyrics",
+            mood="Happy", style="Cinematic", colors="red, blue",
+        )
+        self.assertIn("My Song", result)
+        self.assertIn("Cinematic", result)
+
+    def test_scene_prompt_style_injected_into_image_prompt_field(self):
+        result = streamlit_app.SCENE_PROMPT.format(
+            title="X", artist="Y", lyrics="Z", mood="M", style="Neon Cyberpunk", colors="C",
+        )
+        self.assertIn("Neon Cyberpunk style", result)
+
+
+# ---------------------------------------------------------------------------
+# build_markdown_export
+# ---------------------------------------------------------------------------
+
+class TestBuildMarkdownExport(unittest.TestCase):
+    def _export(self, meta=None, scenes=None):
+        return streamlit_app.build_markdown_export(
+            meta if meta is not None else SAMPLE_META,
+            scenes if scenes is not None else SAMPLE_SCENES,
+        )
+
+    def test_returns_string(self):
+        self.assertIsInstance(self._export(), str)
+
+    def test_contains_title_and_artist(self):
+        result = self._export()
+        self.assertIn("Blinding Lights", result)
+        self.assertIn("The Weeknd", result)
+
+    def test_contains_style_and_mood(self):
+        result = self._export()
+        self.assertIn("Neon Cyberpunk", result)
+        self.assertIn("Euphoric & Uplifting", result)
+
+    def test_scene_headings(self):
+        result = self._export()
+        self.assertIn("## Scene 1: Verse 1", result)
+        self.assertIn("## Scene 2: Chorus", result)
+
+    def test_scene_lyrics_quoted(self):
+        result = self._export()
+        self.assertIn('"I\'ve been tryna call"', result)
+        self.assertIn('"I\'m blinded by the lights"', result)
+
+    def test_scene_narrative_present(self):
+        result = self._export()
+        self.assertIn("The protagonist wanders through empty streets.", result)
+
+    def test_scene_visual_present(self):
+        result = self._export()
+        self.assertIn("Rain-soaked pavement", result)
+
+    def test_scene_camera_present(self):
+        result = self._export()
+        self.assertIn("Slow tracking shot", result)
+
+    def test_scene_duration_present(self):
+        result = self._export()
+        self.assertIn("20s", result)
+        self.assertIn("30s", result)
+
+    def test_scene_transition_present(self):
+        result = self._export()
+        self.assertIn("cut", result)
+        self.assertIn("fade", result)
+
+    def test_image_prompt_in_code_block(self):
+        result = self._export()
+        self.assertIn("```\ncinematic neon rain street\n```", result)
+
+    def test_empty_scenes(self):
+        result = streamlit_app.build_markdown_export(SAMPLE_META, [])
+        self.assertIn("Blinding Lights", result)
+        self.assertNotIn("## Scene", result)
+
+    def test_missing_meta_fields_use_defaults(self):
+        result = streamlit_app.build_markdown_export({}, [])
+        self.assertIn("Music Video", result)
+
+    def test_missing_scene_transition_defaults_to_cut(self):
+        scene = dict(SAMPLE_SCENES[0])
+        del scene["transition"]
+        result = streamlit_app.build_markdown_export(SAMPLE_META, [scene])
+        self.assertIn("**Transition:** cut", result)
+
+    def test_missing_scene_duration_defaults_to_zero(self):
+        scene = dict(SAMPLE_SCENES[0])
+        del scene["duration_sec"]
+        result = streamlit_app.build_markdown_export(SAMPLE_META, [scene])
+        self.assertIn("**Duration:** 0s", result)
+
+    def test_separator_between_scenes(self):
+        result = self._export()
+        self.assertGreaterEqual(result.count("---"), 2)
+
+    def test_single_scene(self):
+        result = streamlit_app.build_markdown_export(SAMPLE_META, [SAMPLE_SCENES[0]])
+        self.assertIn("## Scene 1: Verse 1", result)
+        self.assertNotIn("## Scene 2", result)
+
+    def test_output_starts_with_h1(self):
+        result = self._export()
+        self.assertTrue(result.startswith("# "))
+
+
+# ---------------------------------------------------------------------------
+# build_prompts_export
+# ---------------------------------------------------------------------------
+
+class TestBuildPromptsExport(unittest.TestCase):
+    def test_returns_string(self):
+        self.assertIsInstance(streamlit_app.build_prompts_export(SAMPLE_SCENES), str)
+
+    def test_contains_scene_labels(self):
+        result = streamlit_app.build_prompts_export(SAMPLE_SCENES)
+        self.assertIn("Scene 1 — Verse 1:", result)
+        self.assertIn("Scene 2 — Chorus:", result)
+
+    def test_contains_image_prompts(self):
+        result = streamlit_app.build_prompts_export(SAMPLE_SCENES)
+        self.assertIn("cinematic neon rain street", result)
+        self.assertIn("stadium aerial cinematic", result)
+
+    def test_separator_between_scenes(self):
+        result = streamlit_app.build_prompts_export(SAMPLE_SCENES)
+        self.assertEqual(result.count("\n\n---\n\n"), 1)
+
+    def test_empty_scenes_returns_empty_string(self):
+        self.assertEqual(streamlit_app.build_prompts_export([]), "")
+
+    def test_single_scene_no_separator(self):
+        result = streamlit_app.build_prompts_export([SAMPLE_SCENES[0]])
+        self.assertNotIn("---", result)
+        self.assertIn("Scene 1 — Verse 1:", result)
+
+    def test_missing_image_prompt_yields_empty_prompt(self):
+        result = streamlit_app.build_prompts_export([{"section": "Intro"}])
+        self.assertIn("Scene 1 — Intro:", result)
+        self.assertTrue(result.endswith("Intro:\n"))
+
+    def test_three_scenes_two_separators(self):
+        scenes = SAMPLE_SCENES + [{"section": "Outro", "image_prompt": "sunset fade out"}]
+        result = streamlit_app.build_prompts_export(scenes)
+        self.assertEqual(result.count("\n\n---\n\n"), 2)
+        self.assertIn("Scene 3 — Outro:", result)
+
+
+# ---------------------------------------------------------------------------
+# generate_scenes
+# ---------------------------------------------------------------------------
+
 class TestGenerateScenes(unittest.TestCase):
-    def _mock_client(self, response_text):
-        client = MagicMock()
-        client.messages.create.return_value = _make_mock_response(response_text)
-        return client
+    def setUp(self):
+        self.client = MagicMock()
 
-    def _sample_scenes_json(self):
-        return json.dumps([
-            {
-                "section": "Verse 1",
-                "lyrics": "I can't feel my face",
-                "narrative": "A figure in neon shadows.",
-                "visual": "Close-up on glowing eyes.",
-                "camera": "slow push-in",
-                "color_mood": "electric blue",
-                "image_prompt": "cinematic neon alley",
-                "transition": "cut",
-                "duration_sec": 16,
-            }
-        ])
+    def _call(self, raw_response_text):
+        self.client.messages.create.return_value = _make_mock_response(raw_response_text)
+        return streamlit_app.generate_scenes(
+            self.client, "My Song", "Artist", "Lyrics here",
+            "Happy", "Cinematic Realism", "red, blue",
+        )
 
-    def test_plain_json_parsed_correctly(self):
-        client = self._mock_client(self._sample_scenes_json())
-        scenes = streamlit_app.generate_scenes(client, "Song", "Artist", "lyrics", "mood", "style", "colors")
+    def test_raw_json_array(self):
+        scenes = self._call(VALID_SCENES_JSON)
         self.assertIsInstance(scenes, list)
         self.assertEqual(len(scenes), 1)
         self.assertEqual(scenes[0]["section"], "Verse 1")
 
-    def test_json_wrapped_in_backtick_block_stripped(self):
-        wrapped = f"```\n{self._sample_scenes_json()}\n```"
-        client = self._mock_client(wrapped)
-        scenes = streamlit_app.generate_scenes(client, "Song", "Artist", "lyrics", "mood", "style", "colors")
-        self.assertIsInstance(scenes, list)
+    def test_json_in_markdown_code_fence(self):
+        scenes = self._call(f"```json\n{VALID_SCENES_JSON}\n```")
         self.assertEqual(scenes[0]["section"], "Verse 1")
 
-    def test_json_wrapped_in_json_backtick_block_stripped(self):
-        wrapped = f"```json\n{self._sample_scenes_json()}\n```"
-        client = self._mock_client(wrapped)
-        scenes = streamlit_app.generate_scenes(client, "Song", "Artist", "lyrics", "mood", "style", "colors")
-        self.assertIsInstance(scenes, list)
+    def test_json_in_plain_code_fence(self):
+        scenes = self._call(f"```\n{VALID_SCENES_JSON}\n```")
         self.assertEqual(scenes[0]["section"], "Verse 1")
 
-    def test_multiple_scenes_returned(self):
+    def test_json_with_leading_whitespace(self):
+        scenes = self._call("   \n" + VALID_SCENES_JSON + "\n  ")
+        self.assertIsInstance(scenes, list)
+
+    def test_extra_whitespace_inside_fence(self):
+        scenes = self._call(f"```json\n  {VALID_SCENES_JSON}  \n```")
+        self.assertIsInstance(scenes, list)
+
+    def test_invalid_json_raises(self):
+        with self.assertRaises(json.JSONDecodeError):
+            self._call("not valid json at all")
+
+    def test_returns_multiple_scenes(self):
         multi = json.dumps([
-            _make_scene(section="Intro"),
-            _make_scene(section="Verse 1"),
-            _make_scene(section="Chorus"),
+            {"section": "Verse 1", "duration_sec": 16},
+            {"section": "Chorus", "duration_sec": 30},
         ])
-        client = self._mock_client(multi)
-        scenes = streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
-        self.assertEqual(len(scenes), 3)
-
-    def test_empty_colors_sends_fallback_text(self):
-        """When colors is empty, the prompt should use 'derived from mood and style'."""
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "lyrics", "mood", "style", "")
-        call_kwargs = client.messages.create.call_args
-        messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages") or call_kwargs[0][2]
-        user_content = messages[0]["content"]
-        self.assertIn("derived from mood and style", user_content)
-
-    def test_none_colors_sends_fallback_text(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "lyrics", "mood", "style", None)
-        call_kwargs = client.messages.create.call_args
-        messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
-        user_content = messages[0]["content"]
-        self.assertIn("derived from mood and style", user_content)
+        scenes = self._call(multi)
+        self.assertEqual(len(scenes), 2)
 
     def test_api_called_with_correct_model(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
-        call_kwargs = client.messages.create.call_args
-        model_used = call_kwargs.kwargs.get("model") or call_kwargs[1].get("model")
-        self.assertEqual(model_used, streamlit_app.MODEL)
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertEqual(kwargs["model"], streamlit_app.MODEL)
 
-    def test_api_called_with_system_prompt(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
-        call_kwargs = client.messages.create.call_args
-        system = call_kwargs.kwargs.get("system") or call_kwargs[1].get("system")
-        self.assertIsNotNone(system)
-        self.assertIsInstance(system, list)
+    def test_api_called_with_correct_max_tokens(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertEqual(kwargs["max_tokens"], 8192)
+
+    def test_system_prompt_has_cache_control(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        system = kwargs["system"]
         self.assertEqual(system[0]["type"], "text")
-        self.assertEqual(system[0]["text"], streamlit_app.SYSTEM_PROMPT)
-
-    def test_api_called_with_cache_control(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
-        call_kwargs = client.messages.create.call_args
-        system = call_kwargs.kwargs.get("system") or call_kwargs[1].get("system")
         self.assertEqual(system[0]["cache_control"], {"type": "ephemeral"})
 
-    def test_malformed_json_raises(self):
-        client = self._mock_client("not valid json at all")
-        with self.assertRaises(json.JSONDecodeError):
-            streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
+    def test_prompt_includes_song_title(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "Starlight", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("Starlight", kwargs["messages"][0]["content"])
 
-    def test_prompt_contains_title_and_artist(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "Neon Dreams", "Synth Wave", "lyrics", "mood", "style", "colors")
-        call_kwargs = client.messages.create.call_args
-        messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
-        content = messages[0]["content"]
-        self.assertIn("Neon Dreams", content)
-        self.assertIn("Synth Wave", content)
+    def test_prompt_uses_default_colors_when_empty(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("derived from mood and style", kwargs["messages"][0]["content"])
 
-    def test_prompt_contains_lyrics(self):
-        client = self._mock_client(self._sample_scenes_json())
-        streamlit_app.generate_scenes(client, "T", "A", "unique lyrics text here", "mood", "style", "c")
-        call_kwargs = client.messages.create.call_args
-        messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
-        content = messages[0]["content"]
-        self.assertIn("unique lyrics text here", content)
+    def test_prompt_uses_provided_colors(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "deep indigo")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("deep indigo", kwargs["messages"][0]["content"])
 
-    def test_whitespace_stripped_before_json_parse(self):
-        """Extra whitespace around JSON should not break parsing."""
-        padded = f"\n\n   {self._sample_scenes_json()}   \n\n"
-        client = self._mock_client(padded)
-        scenes = streamlit_app.generate_scenes(client, "T", "A", "l", "m", "s", "c")
-        self.assertIsInstance(scenes, list)
+    def test_user_message_role_is_user(self):
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertEqual(kwargs["messages"][0]["role"], "user")
 
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # get_client
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 class TestGetClient(unittest.TestCase):
     def setUp(self):
-        _st_stub.session_state = {}
+        _reset_session()
+        os.environ.pop("ANTHROPIC_API_KEY", None)
 
-    def test_returns_none_when_no_key_available(self):
-        _st_stub.session_state = {}
-        with patch.dict(os.environ, {}, clear=True):
-            env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-            with patch.dict(os.environ, env, clear=True):
-                result = streamlit_app.get_client()
-        self.assertIsNone(result)
+    def tearDown(self):
+        _reset_session()
+        os.environ.pop("ANTHROPIC_API_KEY", None)
 
-    def test_returns_client_when_env_var_set(self):
-        _st_stub.session_state = {}
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-from-env"}):
-            with patch("streamlit_app.anthropic.Anthropic") as mock_anthropic:
-                mock_instance = MagicMock()
-                mock_anthropic.return_value = mock_instance
-                result = streamlit_app.get_client()
+    def test_returns_none_without_key(self):
+        self.assertIsNone(streamlit_app.get_client())
+
+    def test_returns_client_from_session_state(self):
+        _st_stub.session_state["api_key"] = "sk-test-session"
+        with patch("streamlit_app.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            result = streamlit_app.get_client()
         self.assertIsNotNone(result)
-        mock_anthropic.assert_called_once_with(api_key="test-key-from-env")
+        mock_cls.assert_called_once_with(api_key="sk-test-session")
 
-    def test_returns_client_when_session_state_key_set(self):
-        _st_stub.session_state = {"api_key": "test-key-from-session"}
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-        with patch.dict(os.environ, env, clear=True):
-            with patch("streamlit_app.anthropic.Anthropic") as mock_anthropic:
-                mock_instance = MagicMock()
-                mock_anthropic.return_value = mock_instance
-                result = streamlit_app.get_client()
+    def test_returns_client_from_env_var(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-env"
+        with patch("streamlit_app.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            result = streamlit_app.get_client()
         self.assertIsNotNone(result)
-        mock_anthropic.assert_called_once_with(api_key="test-key-from-session")
+        mock_cls.assert_called_once_with(api_key="sk-test-env")
 
     def test_session_state_key_takes_precedence_over_env(self):
-        """Session state key should be preferred over environment variable."""
-        _st_stub.session_state = {"api_key": "session-key"}
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "env-key"}):
-            with patch("streamlit_app.anthropic.Anthropic") as mock_anthropic:
-                mock_instance = MagicMock()
-                mock_anthropic.return_value = mock_instance
-                streamlit_app.get_client()
-        mock_anthropic.assert_called_once_with(api_key="session-key")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-env-key"
+        _st_stub.session_state["api_key"] = "sk-session-key"
+        with patch("streamlit_app.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            streamlit_app.get_client()
+        mock_cls.assert_called_once_with(api_key="sk-session-key")
 
-    def test_empty_string_key_returns_none(self):
-        """An empty string key is falsy and should return None."""
-        _st_stub.session_state = {"api_key": ""}
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-        with patch.dict(os.environ, env, clear=True):
-            result = streamlit_app.get_client()
-        self.assertIsNone(result)
+    def test_empty_session_state_key_falls_through_to_env(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-env-only"
+        _st_stub.session_state["api_key"] = ""
+        with patch("streamlit_app.anthropic.Anthropic") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            streamlit_app.get_client()
+        mock_cls.assert_called_once_with(api_key="sk-env-only")
 
-    def test_env_empty_string_returns_none(self):
-        _st_stub.session_state = {}
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
-            result = streamlit_app.get_client()
-        self.assertIsNone(result)
+    def test_returns_none_when_env_is_empty_string(self):
+        os.environ["ANTHROPIC_API_KEY"] = ""
+        self.assertIsNone(streamlit_app.get_client())
 
 
-# ===========================================================================
-# SCENE_PROMPT formatting
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# scene_card
+# ---------------------------------------------------------------------------
 
-class TestScenePromptFormatting(unittest.TestCase):
-    """Verify that SCENE_PROMPT produces the expected interpolated output."""
+class TestSceneCard(unittest.TestCase):
+    def setUp(self):
+        _st_stub.markdown.reset_mock()
 
-    def _fmt(self, **kwargs):
-        defaults = dict(title="T", artist="A", mood="M", style="S", colors="C", lyrics="L")
-        defaults.update(kwargs)
-        return streamlit_app.SCENE_PROMPT.format(**defaults)
+    def test_markdown_called_once(self):
+        streamlit_app.scene_card(0, 5, SAMPLE_SCENES[0])
+        _st_stub.markdown.assert_called_once()
 
-    def test_title_interpolated(self):
-        result = self._fmt(title="My Song")
-        self.assertIn("My Song", result)
+    def test_unsafe_allow_html_enabled(self):
+        streamlit_app.scene_card(0, 5, SAMPLE_SCENES[0])
+        _, kwargs = _st_stub.markdown.call_args
+        self.assertTrue(kwargs.get("unsafe_allow_html"))
 
-    def test_artist_interpolated(self):
-        result = self._fmt(artist="The Band")
-        self.assertIn("The Band", result)
+    def test_scene_number_in_html(self):
+        streamlit_app.scene_card(2, 5, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("SCENE 3 / 5", rendered)
 
-    def test_mood_interpolated(self):
-        result = self._fmt(mood="Euphoric & Uplifting")
-        self.assertIn("Euphoric & Uplifting", result)
+    def test_section_label_uppercased(self):
+        streamlit_app.scene_card(0, 1, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("VERSE 1", rendered)
 
-    def test_style_interpolated(self):
-        result = self._fmt(style="Neon Cyberpunk")
-        self.assertIn("Neon Cyberpunk", result)
+    def test_duration_shown(self):
+        streamlit_app.scene_card(0, 1, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("20s", rendered)
 
-    def test_colors_interpolated(self):
-        result = self._fmt(colors="deep red, black")
-        self.assertIn("deep red, black", result)
+    def test_transition_shown(self):
+        streamlit_app.scene_card(0, 1, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("cut", rendered)
 
-    def test_lyrics_interpolated(self):
-        result = self._fmt(lyrics="Never gonna give you up")
-        self.assertIn("Never gonna give you up", result)
+    def test_camera_shown(self):
+        streamlit_app.scene_card(0, 1, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("Slow tracking shot", rendered)
 
-    def test_style_appears_in_image_prompt_template(self):
-        """The style placeholder is used inside the image_prompt field of the schema."""
-        result = self._fmt(style="Dreamy / Surreal")
-        self.assertIn("Dreamy / Surreal", result)
+    def test_color_mood_shown(self):
+        streamlit_app.scene_card(0, 1, SAMPLE_SCENES[0])
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("Neon pink and blue", rendered)
 
+    def test_missing_section_falls_back_to_scene_label(self):
+        streamlit_app.scene_card(3, 10, {})
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("SCENE 4", rendered)
 
-# ===========================================================================
-# build_markdown_export — regression / boundary
-# ===========================================================================
+    def test_missing_duration_defaults_to_zero(self):
+        streamlit_app.scene_card(0, 1, {"section": "Outro"})
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("0s", rendered)
 
-class TestBuildMarkdownExportEdgeCases(unittest.TestCase):
-    def test_special_characters_in_title(self):
-        meta = _make_meta(title="Rock & Roll (Vol. 2)")
-        result = streamlit_app.build_markdown_export(meta, [])
-        self.assertIn("Rock & Roll (Vol. 2)", result)
-
-    def test_unicode_in_lyrics(self):
-        meta = _make_meta()
-        scene = _make_scene(lyrics="Ça plane pour moi — je suis de retour 🎸")
-        result = streamlit_app.build_markdown_export(meta, [scene])
-        self.assertIn("Ça plane pour moi", result)
-
-    def test_ten_scenes_all_numbered(self):
-        meta = _make_meta()
-        scenes = [_make_scene(section=f"Part {i}") for i in range(10)]
-        result = streamlit_app.build_markdown_export(meta, scenes)
-        for n in range(1, 11):
-            self.assertIn(f"## Scene {n}:", result)
-
-    def test_output_is_valid_markdown_heading(self):
-        """The first line should be a valid Markdown H1."""
-        meta = _make_meta(title="Test Song", artist="Test Artist")
-        result = streamlit_app.build_markdown_export(meta, [])
-        self.assertTrue(result.startswith("# "))
+    def test_missing_transition_defaults_to_cut(self):
+        streamlit_app.scene_card(0, 1, {"section": "Bridge"})
+        rendered = _st_stub.markdown.call_args[0][0]
+        self.assertIn("cut", rendered)
 
 
-class TestBuildPromptsExportEdgeCases(unittest.TestCase):
-    def test_long_image_prompt_preserved(self):
-        long_prompt = "cinematic " * 100
-        scene = _make_scene(image_prompt=long_prompt)
-        result = streamlit_app.build_prompts_export([scene])
-        self.assertIn(long_prompt.strip(), result)
+# ---------------------------------------------------------------------------
+# render_storyboard
+# ---------------------------------------------------------------------------
 
-    def test_special_chars_in_section_name(self):
-        scene = _make_scene(section="Chorus (x2) — Final")
-        result = streamlit_app.build_prompts_export([scene])
-        self.assertIn("Chorus (x2) — Final", result)
+class TestRenderStoryboard(unittest.TestCase):
+    def _make_columns(self):
+        col1, col2 = MagicMock(), MagicMock()
+        for c in (col1, col2):
+            c.__enter__ = MagicMock(return_value=c)
+            c.__exit__ = MagicMock(return_value=False)
+            c.markdown = MagicMock()
+            c.code = MagicMock()
+        return [col1, col2]
+
+    def setUp(self):
+        _st_stub.markdown.reset_mock()
+        _st_stub.divider.reset_mock()
+        _st_stub.columns.side_effect = lambda *a, **kw: self._make_columns()
+        exp_cm = MagicMock()
+        exp_cm.__enter__ = MagicMock(return_value=exp_cm)
+        exp_cm.__exit__ = MagicMock(return_value=False)
+        _st_stub.expander.return_value = exp_cm
+
+    def test_divider_called_per_scene(self):
+        streamlit_app.render_storyboard(SAMPLE_SCENES)
+        self.assertEqual(_st_stub.divider.call_count, len(SAMPLE_SCENES))
+
+    def test_columns_called_per_scene(self):
+        streamlit_app.render_storyboard(SAMPLE_SCENES)
+        self.assertEqual(_st_stub.columns.call_count, len(SAMPLE_SCENES))
+
+    def test_empty_storyboard_no_calls(self):
+        streamlit_app.render_storyboard([])
+        _st_stub.divider.assert_not_called()
+
+    def test_long_lyrics_truncated(self):
+        scene = dict(SAMPLE_SCENES[0], lyrics="A" * 200)
+        _st_stub.markdown.reset_mock()
+        streamlit_app.render_storyboard([scene])
+        calls_text = " ".join(
+            str(c[0][0]) for c in _st_stub.markdown.call_args_list if c[0]
+        )
+        self.assertIn("…", calls_text)
+
+    def test_lyrics_at_exactly_140_chars_not_truncated(self):
+        scene = dict(SAMPLE_SCENES[0], lyrics="B" * 140)
+        _st_stub.markdown.reset_mock()
+        streamlit_app.render_storyboard([scene])
+        calls_text = " ".join(
+            str(c[0][0]) for c in _st_stub.markdown.call_args_list if c[0]
+        )
+        self.assertNotIn("…", calls_text)
+
+    def test_columns_split_is_1_2(self):
+        captured = []
+        orig = _st_stub.columns.side_effect
+
+        def capture(*args, **kwargs):
+            captured.append(args)
+            return orig(*args, **kwargs)
+
+        _st_stub.columns.side_effect = capture
+        streamlit_app.render_storyboard([SAMPLE_SCENES[0]])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], [1, 2])
 
 
 if __name__ == "__main__":
