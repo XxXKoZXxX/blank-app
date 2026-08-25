@@ -34,6 +34,7 @@ def _make_st_stub():
         "info", "error", "success", "spinner", "expander", "code",
         "text_input", "text_area", "selectbox", "button", "download_button",
         "metric", "set_page_config", "tabs", "columns", "sidebar",
+        "image", "progress", "empty", "warning", "text", "rerun",
     ):
         setattr(st, name, MagicMock())
 
@@ -80,8 +81,8 @@ def _reset_session():
 # ---------------------------------------------------------------------------
 
 SAMPLE_META = {
-    "title": "Blinding Lights",
-    "artist": "The Weeknd",
+    "title": "Midnight Static",
+    "artist": "Test Artist",
     "mood": "Euphoric & Uplifting",
     "style": "Neon Cyberpunk",
 }
@@ -89,7 +90,7 @@ SAMPLE_META = {
 SAMPLE_SCENES = [
     {
         "section": "Verse 1",
-        "lyrics": "I've been tryna call",
+        "lyrics": "placeholder verse line one",
         "narrative": "The protagonist wanders through empty streets.",
         "visual": "Rain-soaked pavement, neon reflections.",
         "camera": "Slow tracking shot",
@@ -100,7 +101,7 @@ SAMPLE_SCENES = [
     },
     {
         "section": "Chorus",
-        "lyrics": "I'm blinded by the lights",
+        "lyrics": "placeholder chorus line",
         "narrative": "An explosion of colour fills the frame.",
         "visual": "Bright stadium lights, crowd silhouettes.",
         "camera": "Wide aerial shot",
@@ -110,6 +111,17 @@ SAMPLE_SCENES = [
         "duration_sec": 30,
     },
 ]
+
+SAMPLE_BIBLE = {
+    "logline": "A courier crosses a flooded city to deliver one last message.",
+    "protagonist": "Late-20s courier, shaved head, scar through left eyebrow",
+    "wardrobe": "Cracked black rain shell over a grey work shirt",
+    "locations": ["Flooded underpass", "Rooftop antenna field"],
+    "palette": ["#0d0d1a", "#e94560", "#f5a623"],
+    "lighting": "Sodium streetlight through heavy rain",
+    "motifs": ["Standing water", "Broken neon signage"],
+    "references": "Blade Runner 2049, Under the Skin",
+}
 
 VALID_SCENES_JSON = json.dumps([
     {
@@ -140,7 +152,17 @@ def _make_mock_response(text):
 
 class TestConstants(unittest.TestCase):
     def test_model_name(self):
-        self.assertEqual(streamlit_app.MODEL, "claude-opus-4-8")
+        self.assertEqual(streamlit_app.MODEL, "claude-opus-5")
+
+    def test_bible_prompt_has_all_placeholders(self):
+        for key in ("{title}", "{artist}", "{mood}", "{style}", "{colors}", "{lyrics}"):
+            self.assertIn(key, streamlit_app.BIBLE_PROMPT)
+
+    def test_image_models_are_non_empty_mapping(self):
+        self.assertTrue(streamlit_app.IMAGE_MODELS)
+        for label, repo in streamlit_app.IMAGE_MODELS.items():
+            self.assertIsInstance(label, str)
+            self.assertIn("/", repo)
 
     def test_visual_styles_count(self):
         self.assertEqual(len(streamlit_app.VISUAL_STYLES), 10)
@@ -215,8 +237,8 @@ class TestBuildMarkdownExport(unittest.TestCase):
 
     def test_contains_title_and_artist(self):
         result = self._export()
-        self.assertIn("Blinding Lights", result)
-        self.assertIn("The Weeknd", result)
+        self.assertIn("Midnight Static", result)
+        self.assertIn("Test Artist", result)
 
     def test_contains_style_and_mood(self):
         result = self._export()
@@ -230,8 +252,8 @@ class TestBuildMarkdownExport(unittest.TestCase):
 
     def test_scene_lyrics_quoted(self):
         result = self._export()
-        self.assertIn('"I\'ve been tryna call"', result)
-        self.assertIn('"I\'m blinded by the lights"', result)
+        self.assertIn('"placeholder verse line one"', result)
+        self.assertIn('"placeholder chorus line"', result)
 
     def test_scene_narrative_present(self):
         result = self._export()
@@ -261,7 +283,7 @@ class TestBuildMarkdownExport(unittest.TestCase):
 
     def test_empty_scenes(self):
         result = streamlit_app.build_markdown_export(SAMPLE_META, [])
-        self.assertIn("Blinding Lights", result)
+        self.assertIn("Midnight Static", result)
         self.assertNotIn("## Scene", result)
 
     def test_missing_meta_fields_use_defaults(self):
@@ -611,6 +633,368 @@ class TestRenderStoryboard(unittest.TestCase):
         streamlit_app.render_storyboard([SAMPLE_SCENES[0]])
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0][0], [1, 2])
+
+
+# ---------------------------------------------------------------------------
+# parse_duration
+# ---------------------------------------------------------------------------
+
+class TestParseDuration(unittest.TestCase):
+    def test_mmss_format(self):
+        self.assertEqual(streamlit_app.parse_duration("3:45"), 225)
+
+    def test_mmss_leading_zero(self):
+        self.assertEqual(streamlit_app.parse_duration("03:05"), 185)
+
+    def test_long_track(self):
+        self.assertEqual(streamlit_app.parse_duration("12:00"), 720)
+
+    def test_bare_seconds(self):
+        self.assertEqual(streamlit_app.parse_duration("225"), 225)
+
+    def test_whitespace_tolerated(self):
+        self.assertEqual(streamlit_app.parse_duration("  3:45  "), 225)
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(streamlit_app.parse_duration(""))
+
+    def test_none_returns_none(self):
+        self.assertIsNone(streamlit_app.parse_duration(None))
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(streamlit_app.parse_duration("about four minutes"))
+
+    def test_invalid_seconds_field_returns_none(self):
+        """Seconds above 59 are not a valid timestamp."""
+        self.assertIsNone(streamlit_app.parse_duration("3:75"))
+
+    def test_zero(self):
+        self.assertEqual(streamlit_app.parse_duration("0"), 0)
+
+
+# ---------------------------------------------------------------------------
+# scale_durations
+# ---------------------------------------------------------------------------
+
+class TestScaleDurations(unittest.TestCase):
+    def test_sums_to_target_exactly(self):
+        scaled = streamlit_app.scale_durations(SAMPLE_SCENES, 100)
+        self.assertEqual(sum(s["duration_sec"] for s in scaled), 100)
+
+    def test_preserves_relative_proportions(self):
+        """Input is 20s/30s, so the second scene stays the longer one."""
+        scaled = streamlit_app.scale_durations(SAMPLE_SCENES, 100)
+        self.assertLess(scaled[0]["duration_sec"], scaled[1]["duration_sec"])
+
+    def test_does_not_mutate_input(self):
+        original = [dict(s) for s in SAMPLE_SCENES]
+        streamlit_app.scale_durations(SAMPLE_SCENES, 500)
+        self.assertEqual(SAMPLE_SCENES, original)
+
+    def test_preserves_other_scene_fields(self):
+        scaled = streamlit_app.scale_durations(SAMPLE_SCENES, 100)
+        self.assertEqual(scaled[0]["section"], "Verse 1")
+        self.assertEqual(scaled[0]["camera"], "Slow tracking shot")
+
+    def test_scaling_up(self):
+        scaled = streamlit_app.scale_durations(SAMPLE_SCENES, 600)
+        self.assertEqual(sum(s["duration_sec"] for s in scaled), 600)
+
+    def test_scaling_down(self):
+        scaled = streamlit_app.scale_durations(SAMPLE_SCENES, 10)
+        self.assertEqual(sum(s["duration_sec"] for s in scaled), 10)
+
+    def test_empty_scenes_returns_empty(self):
+        self.assertEqual(streamlit_app.scale_durations([], 100), [])
+
+    def test_no_target_returns_unchanged(self):
+        result = streamlit_app.scale_durations(SAMPLE_SCENES, None)
+        self.assertEqual(result, SAMPLE_SCENES)
+
+    def test_zero_target_returns_unchanged(self):
+        result = streamlit_app.scale_durations(SAMPLE_SCENES, 0)
+        self.assertEqual(result, SAMPLE_SCENES)
+
+    def test_scenes_with_no_durations_split_evenly(self):
+        scenes = [{"section": "A"}, {"section": "B"}, {"section": "C"}]
+        scaled = streamlit_app.scale_durations(scenes, 90)
+        self.assertEqual(sum(s["duration_sec"] for s in scaled), 90)
+
+    def test_every_scene_gets_at_least_one_second(self):
+        many = [dict(SAMPLE_SCENES[0]) for _ in range(20)]
+        scaled = streamlit_app.scale_durations(many, 5)
+        for s in scaled:
+            self.assertGreaterEqual(s["duration_sec"], 1)
+
+
+# ---------------------------------------------------------------------------
+# generate_bible / _bible_context
+# ---------------------------------------------------------------------------
+
+class TestGenerateBible(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock()
+
+    def test_parses_bible_json(self):
+        self.client.messages.create.return_value = _make_mock_response(
+            json.dumps(SAMPLE_BIBLE)
+        )
+        result = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C"
+        )
+        self.assertEqual(result["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_strips_code_fence(self):
+        self.client.messages.create.return_value = _make_mock_response(
+            f"```json\n{json.dumps(SAMPLE_BIBLE)}\n```"
+        )
+        result = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C"
+        )
+        self.assertEqual(result["logline"], SAMPLE_BIBLE["logline"])
+
+    def test_uses_smaller_token_budget(self):
+        self.client.messages.create.return_value = _make_mock_response(
+            json.dumps(SAMPLE_BIBLE)
+        )
+        streamlit_app.generate_bible(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertEqual(kwargs["max_tokens"], 2048)
+
+    def test_prompt_includes_lyrics(self):
+        self.client.messages.create.return_value = _make_mock_response(
+            json.dumps(SAMPLE_BIBLE)
+        )
+        streamlit_app.generate_bible(
+            self.client, "T", "A", "distinctive lyric marker", "M", "S", "C"
+        )
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("distinctive lyric marker", kwargs["messages"][0]["content"])
+
+
+class TestBibleContext(unittest.TestCase):
+    def test_empty_bible_returns_empty_string(self):
+        self.assertEqual(streamlit_app._bible_context(None), "")
+        self.assertEqual(streamlit_app._bible_context({}), "")
+
+    def test_includes_protagonist_and_wardrobe(self):
+        ctx = streamlit_app._bible_context(SAMPLE_BIBLE)
+        self.assertIn(SAMPLE_BIBLE["protagonist"], ctx)
+        self.assertIn(SAMPLE_BIBLE["wardrobe"], ctx)
+
+    def test_joins_list_fields(self):
+        ctx = streamlit_app._bible_context(SAMPLE_BIBLE)
+        self.assertIn("Flooded underpass", ctx)
+        self.assertIn("Broken neon signage", ctx)
+
+    def test_tolerates_missing_keys(self):
+        ctx = streamlit_app._bible_context({"logline": "just a logline"})
+        self.assertIn("just a logline", ctx)
+
+
+class TestGenerateScenesWithBible(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.messages.create.return_value = _make_mock_response(VALID_SCENES_JSON)
+
+    def test_bible_injected_into_prompt(self):
+        streamlit_app.generate_scenes(
+            self.client, "T", "A", "L", "M", "S", "C", bible=SAMPLE_BIBLE
+        )
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn(SAMPLE_BIBLE["protagonist"], kwargs["messages"][0]["content"])
+
+    def test_without_bible_prompt_has_no_bible_header(self):
+        streamlit_app.generate_scenes(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertNotIn("VISUAL BIBLE", kwargs["messages"][0]["content"])
+
+    def test_bible_precedes_scene_instructions(self):
+        streamlit_app.generate_scenes(
+            self.client, "T", "A", "L", "M", "S", "C", bible=SAMPLE_BIBLE
+        )
+        _, kwargs = self.client.messages.create.call_args
+        content = kwargs["messages"][0]["content"]
+        self.assertLess(content.index("VISUAL BIBLE"), content.index("Create a full music video"))
+
+
+# ---------------------------------------------------------------------------
+# generate_image
+# ---------------------------------------------------------------------------
+
+def _make_http_response(status_code, content=b"", text=""):
+    r = MagicMock()
+    r.status_code = status_code
+    r.content = content
+    r.text = text
+    return r
+
+
+class TestGenerateImage(unittest.TestCase):
+    def test_no_token_returns_error(self):
+        data, err = streamlit_app.generate_image("", "a prompt")
+        self.assertIsNone(data)
+        self.assertIn("token", err.lower())
+
+    def test_success_returns_bytes(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(200, content=b"PNGDATA")
+            data, err = streamlit_app.generate_image("hf_tok", "a prompt")
+        self.assertEqual(data, b"PNGDATA")
+        self.assertIsNone(err)
+
+    def test_token_sent_as_bearer_header(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(200, content=b"X")
+            streamlit_app.generate_image("hf_tok", "a prompt")
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer hf_tok")
+
+    def test_prompt_sent_as_inputs(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(200, content=b"X")
+            streamlit_app.generate_image("hf_tok", "neon rain street")
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["json"]["inputs"], "neon rain street")
+
+    def test_model_appears_in_url(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(200, content=b"X")
+            streamlit_app.generate_image("hf_tok", "p", model="org/some-model")
+        args, _ = mock_post.call_args
+        self.assertIn("org/some-model", args[0])
+
+    def test_401_reports_invalid_token(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(401)
+            data, err = streamlit_app.generate_image("bad", "p")
+        self.assertIsNone(data)
+        self.assertIn("Invalid", err)
+
+    def test_503_reports_model_loading(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(503)
+            data, err = streamlit_app.generate_image("hf_tok", "p")
+        self.assertIsNone(data)
+        self.assertIn("loading", err.lower())
+
+    def test_unexpected_status_includes_code(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.return_value = _make_http_response(418, text="teapot")
+            data, err = streamlit_app.generate_image("hf_tok", "p")
+        self.assertIsNone(data)
+        self.assertIn("418", err)
+
+    def test_timeout_handled(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.side_effect = streamlit_app.requests.exceptions.Timeout()
+            data, err = streamlit_app.generate_image("hf_tok", "p")
+        self.assertIsNone(data)
+        self.assertIn("imed out", err)
+
+    def test_network_error_handled(self):
+        with patch("streamlit_app.requests.post") as mock_post:
+            mock_post.side_effect = streamlit_app.requests.exceptions.ConnectionError("boom")
+            data, err = streamlit_app.generate_image("hf_tok", "p")
+        self.assertIsNone(data)
+        self.assertIn("Network error", err)
+
+
+# ---------------------------------------------------------------------------
+# build_edl_export
+# ---------------------------------------------------------------------------
+
+class TestBuildEdlExport(unittest.TestCase):
+    def test_returns_string(self):
+        self.assertIsInstance(streamlit_app.build_edl_export(SAMPLE_SCENES), str)
+
+    def test_timecodes_run_consecutively(self):
+        """Scene 1 is 20s, so scene 2 starts at 00:20 and ends at 00:50."""
+        result = streamlit_app.build_edl_export(SAMPLE_SCENES)
+        self.assertIn("00:00 → 00:20", result)
+        self.assertIn("00:20 → 00:50", result)
+
+    def test_total_runtime_reported(self):
+        result = streamlit_app.build_edl_export(SAMPLE_SCENES)
+        self.assertIn("TOTAL RUNTIME: 0m 50s", result)
+
+    def test_minutes_roll_over(self):
+        scenes = [dict(SAMPLE_SCENES[0], duration_sec=90)]
+        result = streamlit_app.build_edl_export(scenes)
+        self.assertIn("00:00 → 01:30", result)
+        self.assertIn("TOTAL RUNTIME: 1m 30s", result)
+
+    def test_sections_and_transitions_listed(self):
+        result = streamlit_app.build_edl_export(SAMPLE_SCENES)
+        self.assertIn("Verse 1", result)
+        self.assertIn("out: fade", result)
+
+    def test_empty_scenes_still_reports_zero_runtime(self):
+        result = streamlit_app.build_edl_export([])
+        self.assertIn("TOTAL RUNTIME: 0m 0s", result)
+
+    def test_missing_duration_treated_as_zero(self):
+        result = streamlit_app.build_edl_export([{"section": "Intro"}])
+        self.assertIn("00:00 → 00:00", result)
+
+
+# ---------------------------------------------------------------------------
+# build_markdown_export with a bible
+# ---------------------------------------------------------------------------
+
+class TestMarkdownExportWithBible(unittest.TestCase):
+    def test_bible_section_included(self):
+        result = streamlit_app.build_markdown_export(
+            SAMPLE_META, SAMPLE_SCENES, SAMPLE_BIBLE
+        )
+        self.assertIn("## Visual Bible", result)
+        self.assertIn(SAMPLE_BIBLE["protagonist"], result)
+
+    def test_bible_lists_joined(self):
+        result = streamlit_app.build_markdown_export(
+            SAMPLE_META, SAMPLE_SCENES, SAMPLE_BIBLE
+        )
+        self.assertIn("Flooded underpass", result)
+
+    def test_omitted_bible_leaves_no_section(self):
+        result = streamlit_app.build_markdown_export(SAMPLE_META, SAMPLE_SCENES)
+        self.assertNotIn("## Visual Bible", result)
+
+    def test_scenes_still_present_alongside_bible(self):
+        result = streamlit_app.build_markdown_export(
+            SAMPLE_META, SAMPLE_SCENES, SAMPLE_BIBLE
+        )
+        self.assertIn("## Scene 1: Verse 1", result)
+
+
+# ---------------------------------------------------------------------------
+# get_hf_token
+# ---------------------------------------------------------------------------
+
+class TestGetHfToken(unittest.TestCase):
+    def setUp(self):
+        _reset_session()
+        os.environ.pop("HF_TOKEN", None)
+
+    def tearDown(self):
+        _reset_session()
+        os.environ.pop("HF_TOKEN", None)
+
+    def test_empty_without_any_source(self):
+        self.assertEqual(streamlit_app.get_hf_token(), "")
+
+    def test_reads_session_state(self):
+        _st_stub.session_state["hf_token"] = "hf_session"
+        self.assertEqual(streamlit_app.get_hf_token(), "hf_session")
+
+    def test_reads_env_var(self):
+        os.environ["HF_TOKEN"] = "hf_env"
+        self.assertEqual(streamlit_app.get_hf_token(), "hf_env")
+
+    def test_session_state_wins_over_env(self):
+        os.environ["HF_TOKEN"] = "hf_env"
+        _st_stub.session_state["hf_token"] = "hf_session"
+        self.assertEqual(streamlit_app.get_hf_token(), "hf_session")
 
 
 if __name__ == "__main__":
