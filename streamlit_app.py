@@ -16,6 +16,11 @@ IMAGE_MODELS = {
     "Stable Diffusion 3.5 Large": "stabilityai/stable-diffusion-3.5-large",
 }
 
+# Used only when a protagonist reference photo is supplied. Kontext is an
+# image-editing model: it takes the reference plus a prompt and re-stages the
+# same person, which plain text-to-image cannot do.
+REFERENCE_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
+
 HF_ENDPOINT = "https://router.huggingface.co/hf-inference/models/{model}"
 
 VISUAL_STYLES = [
@@ -301,6 +306,73 @@ def generate_image(token, prompt, model="black-forest-labs/FLUX.1-schnell"):
     return None, f"HTTP {response.status_code}: {response.text[:200]}"
 
 
+def generate_image_from_reference(token, reference_bytes, prompt,
+                                 model=REFERENCE_MODEL):
+    """Render a frame that keeps the protagonist's likeness.
+
+    Sends the reference photo plus the scene prompt to an image-editing model,
+    which re-stages that person in the described setting. Identity carries far
+    better than any text description can manage, though it is a likeness rather
+    than a photographic match.
+
+    Returns (image_bytes, None) or (None, error_message).
+    """
+    if not token:
+        return None, "No Hugging Face token — add one in the sidebar."
+    if not reference_bytes:
+        return None, "No reference photo supplied."
+
+    import base64
+
+    payload = {
+        "inputs": base64.b64encode(reference_bytes).decode("ascii"),
+        "parameters": {"prompt": prompt},
+    }
+    try:
+        response = requests.post(
+            HF_ENDPOINT.format(model=model),
+            headers={"Authorization": f"Bearer {token}", "Accept": "image/png"},
+            json=payload,
+            timeout=180,
+        )
+    except requests.exceptions.Timeout:
+        return None, "Timed out after 180s — reference rendering is slower."
+    except requests.exceptions.RequestException as e:
+        return None, f"Network error: {e}"
+
+    if response.status_code == 200:
+        return response.content, None
+
+    messages = {
+        401: "Invalid Hugging Face token.",
+        402: "Hugging Face credits exhausted for this account.",
+        404: (f"No serverless image-editing endpoint for {model}. "
+              "Clear the reference photo to fall back to text-to-image."),
+        503: "Model is loading on Hugging Face — retry in ~30s.",
+    }
+    if response.status_code in messages:
+        return None, messages[response.status_code]
+
+    return None, f"HTTP {response.status_code}: {response.text[:200]}"
+
+
+def render_frame(token, prompt, model, reference_bytes=None):
+    """Render one frame, using the protagonist reference when there is one.
+
+    Falls back to text-to-image if reference rendering fails, so a missing
+    Kontext endpoint degrades to a working frame rather than no frame.
+    """
+    if reference_bytes:
+        data, err = generate_image_from_reference(token, reference_bytes, prompt)
+        if data:
+            return data, None
+        fallback, fb_err = generate_image(token, prompt, model)
+        if fallback:
+            return fallback, f"reference render failed ({err}) — used text-to-image"
+        return None, f"{err}; fallback also failed: {fb_err}"
+    return generate_image(token, prompt, model)
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -549,6 +621,32 @@ def main():
             ),
         )
 
+        ref_photo = st.file_uploader(
+            "Protagonist reference photo (optional)",
+            type=["png", "jpg", "jpeg", "webp"],
+            help=(
+                "A clear photo of the person. Frames are then rendered by an "
+                "image-editing model that re-stages this person in each scene, "
+                "so their likeness carries across the whole video. Expect a "
+                "strong likeness, not a photographic match."
+            ),
+        )
+        if ref_photo is not None:
+            st.session_state["protagonist_ref"] = ref_photo.getvalue()
+        if st.session_state.get("protagonist_ref"):
+            ref_cols = st.columns([1, 4])
+            with ref_cols[0]:
+                st.image(st.session_state["protagonist_ref"], width=110)
+            with ref_cols[1]:
+                st.caption(
+                    "Casting locked to this photo. Frames render through "
+                    f"`{REFERENCE_MODEL}`, falling back to text-to-image if "
+                    "that endpoint is unavailable."
+                )
+                if st.button("Clear reference photo"):
+                    st.session_state.pop("protagonist_ref", None)
+                    st.rerun()
+
         lyrics = st.text_area(
             "Lyrics",
             height=320,
@@ -647,7 +745,10 @@ def main():
 
                 for i, s in enumerate(scenes):
                     status.text(f"Rendering scene {i + 1} of {len(scenes)} — {s.get('section', '')}")
-                    data, err = generate_image(token, s.get("image_prompt", ""), model)
+                    data, err = render_frame(
+                        token, s.get("image_prompt", ""), model,
+                        reference_bytes=st.session_state.get("protagonist_ref"),
+                    )
                     if data:
                         images[i] = data
                     else:
@@ -686,7 +787,10 @@ def main():
                     st.markdown(f"**Scene {i + 1} — {s.get('section', '')}**")
                     if st.button("🔄 Render", key=f"render_{i}", disabled=not token):
                         with st.spinner("Rendering…"):
-                            data, err = generate_image(token, s.get("image_prompt", ""), model)
+                            data, err = render_frame(
+                                token, s.get("image_prompt", ""), model,
+                                reference_bytes=st.session_state.get("protagonist_ref"),
+                            )
                         if data:
                             images[i] = data
                             st.session_state["images"] = images
