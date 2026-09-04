@@ -35,6 +35,7 @@ def _make_st_stub():
         "text_input", "text_area", "selectbox", "button", "download_button",
         "metric", "set_page_config", "tabs", "columns", "sidebar",
         "image", "progress", "empty", "warning", "text", "rerun",
+        "file_uploader", "slider", "video",
     ):
         setattr(st, name, MagicMock())
 

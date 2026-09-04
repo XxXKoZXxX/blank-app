@@ -4,6 +4,9 @@ import requests
 import json
 import os
 import re
+import tempfile
+
+import video_pipeline as vp
 
 MODEL = "claude-opus-5"
 
@@ -484,8 +487,8 @@ def main():
         st.markdown(f"**Storyboards by** `{MODEL}`")
 
     # ── tabs ─────────────────────────────────────────────────────────
-    tab_create, tab_board, tab_frames, tab_export = st.tabs(
-        ["🎬 Create", "🎭 Storyboard", "🖼 Frames", "📥 Export"]
+    tab_create, tab_board, tab_frames, tab_video, tab_export = st.tabs(
+        ["🎬 Create", "🎭 Storyboard", "🖼 Frames", "🎞 Video", "📥 Export"]
     )
 
     with tab_create:
@@ -660,6 +663,148 @@ def main():
                         )
 
                 st.divider()
+
+    with tab_video:
+        if "scenes" not in st.session_state:
+            st.info("Generate your music video first in the **Create** tab.")
+        else:
+            scenes = st.session_state["scenes"]
+            images = st.session_state.get("images", {})
+
+            ff_ok, ff_msg = vp.check_ffmpeg()
+            if ff_ok:
+                st.caption(f"\u2705 {ff_msg}")
+            else:
+                st.error(ff_msg)
+                st.code(
+                    "macOS:    brew install ffmpeg\n"
+                    "Ubuntu:   sudo apt install ffmpeg\n"
+                    "Windows:  winget install Gyan.FFmpeg",
+                    language="",
+                )
+
+            missing = [i + 1 for i in range(len(scenes)) if i not in images]
+            if missing:
+                shown = ", ".join(str(n) for n in missing[:8])
+                more = "\u2026" if len(missing) > 8 else ""
+                st.warning(
+                    f"{len(missing)} of {len(scenes)} frames not rendered yet "
+                    f"(scenes {shown}{more}). Render them on the **Frames** tab "
+                    "\u2014 only rendered scenes make it into the cut."
+                )
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                audio_file = st.file_uploader(
+                    "Song audio",
+                    type=["mp3", "wav", "m4a", "flac", "ogg"],
+                    help="Muxed into the final cut. Never leaves this machine.",
+                )
+                crossfade = st.slider(
+                    "Crossfade seconds (0 = hard cuts)",
+                    0.0, 2.0, 0.0, 0.25,
+                    help="The storyboard is mostly hard cuts. Raise this to dissolve every join.",
+                )
+            with col_b:
+                ts_text = st.text_area(
+                    "Section timestamps (optional)",
+                    height=170,
+                    placeholder="0:00 intro\n0:15 verse 1\n1:10 pre-chorus\n2:05 hook",
+                    help=(
+                        "One mark per line. Scene durations are rebuilt from these "
+                        "so the cut lands on your actual master instead of estimates."
+                    ),
+                )
+
+            marks = vp.parse_timestamp_map(ts_text)
+            if marks:
+                st.caption(f"Parsed {len(marks)} marks \u2014 scene durations will follow them.")
+
+            if st.button(
+                "\U0001F39E Build Video",
+                type="primary",
+                disabled=not (ff_ok and images),
+                use_container_width=True,
+            ):
+                workdir = tempfile.mkdtemp(prefix="mvs_")
+                progress = st.progress(0.0)
+                status = st.empty()
+
+                audio_path = None
+                if audio_file is not None:
+                    ext = os.path.splitext(audio_file.name)[1] or ".mp3"
+                    audio_path = os.path.join(workdir, "track" + ext)
+                    with open(audio_path, "wb") as fh:
+                        fh.write(audio_file.getbuffer())
+
+                timeline = [dict(s) for s in scenes]
+                if marks:
+                    total = vp.probe_duration(audio_path) if audio_path else None
+                    timeline = vp.apply_timestamp_map(
+                        timeline, marks, int(total) if total else None
+                    )
+
+                order = sorted(images.keys())
+                clips, durations, failures = [], [], []
+
+                for n, idx in enumerate(order):
+                    scene = timeline[idx] if idx < len(timeline) else {}
+                    duration = float(scene.get("duration_sec") or 4)
+                    motion = vp.infer_motion(scene.get("camera", ""))
+                    status.text(
+                        f"Clip {n + 1}/{len(order)} \u2014 "
+                        f"{scene.get('section', '')} [{motion}, {duration:.0f}s]"
+                    )
+
+                    frame_path = os.path.join(workdir, f"f{idx:03d}.png")
+                    with open(frame_path, "wb") as fh:
+                        fh.write(images[idx])
+
+                    clip_path = os.path.join(workdir, f"c{idx:03d}.mp4")
+                    made, err = vp.ken_burns_clip(
+                        frame_path, duration, clip_path, motion=motion
+                    )
+                    if made:
+                        clips.append(made)
+                        durations.append(duration)
+                    else:
+                        failures.append(f"Scene {idx + 1}: {err}")
+                    progress.progress((n + 1) / (len(order) + 1))
+
+                status.text("Assembling final cut\u2026")
+                out_path = os.path.join(workdir, "music_video.mp4")
+                final, err = vp.assemble(
+                    clips, out_path, audio_path=audio_path,
+                    crossfade=crossfade, durations=durations,
+                )
+                progress.empty()
+                status.empty()
+
+                for failure in failures:
+                    st.text(f"\u00b7 {failure}")
+
+                if final:
+                    st.session_state["video_path"] = final
+                    length = vp.probe_duration(final) or 0
+                    st.success(
+                        f"\u2705 Built {len(clips)} clips \u2014 "
+                        f"{int(length) // 60}m {int(length) % 60}s"
+                    )
+                else:
+                    st.error(f"Assembly failed: {err}")
+
+            built = st.session_state.get("video_path")
+            if built and os.path.exists(built):
+                st.divider()
+                st.video(built)
+                with open(built, "rb") as fh:
+                    st.download_button(
+                        "\u2b07\ufe0f Download MP4",
+                        fh.read(),
+                        file_name="music_video.mp4",
+                        mime="video/mp4",
+                        use_container_width=True,
+                    )
 
     with tab_export:
         if "scenes" not in st.session_state:
