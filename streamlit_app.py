@@ -199,13 +199,38 @@ def _call(client, prompt, max_tokens=8192):
     return response.content[0].text
 
 
-def generate_bible(client, title, artist, lyrics, mood, style, colors):
-    """Generate the visual bible that keeps every frame consistent."""
-    prompt = BIBLE_PROMPT.format(
+def _casting_context(protagonist):
+    """Prompt prefix that locks an already-cast protagonist.
+
+    Kept out of BIBLE_PROMPT so that template keeps its fixed placeholder set
+    and stays formattable on its own.
+    """
+    if not protagonist or not protagonist.strip():
+        return ""
+    return (
+        "--- CASTING (already decided, do not invent an alternative) ---\n"
+        f"The protagonist is cast: {protagonist.strip()}\n"
+        "Treat this as fixed. Build the wardrobe, locations, palette and motifs "
+        "around this person instead of proposing someone else.\n"
+        "---\n\n"
+    )
+
+
+def generate_bible(client, title, artist, lyrics, mood, style, colors,
+                   protagonist=None):
+    """Generate the visual bible that keeps every frame consistent.
+
+    A protagonist passed here overrides whatever the model returns, so the
+    casting the user chose is what reaches every downstream image prompt.
+    """
+    prompt = _casting_context(protagonist) + BIBLE_PROMPT.format(
         title=title, artist=artist, lyrics=lyrics,
         mood=mood, style=style, colors=colors or "derived from mood and style",
     )
-    return _extract_json(_call(client, prompt, max_tokens=2048))
+    bible = _extract_json(_call(client, prompt, max_tokens=2048))
+    if protagonist and protagonist.strip():
+        bible["protagonist"] = protagonist.strip()
+    return bible
 
 
 def _bible_context(bible):
@@ -509,6 +534,21 @@ def main():
                 help="Scene durations are scaled to match your actual track.",
             )
 
+        protagonist = st.text_area(
+            "Protagonist (optional)",
+            height=90,
+            placeholder=(
+                "Who are we following? e.g. \"Early-30s man, lean angular face, "
+                "light stubble, black snapback worn straight, black graphic hoodie.\" "
+                "Leave blank and one gets invented for you."
+            ),
+            help=(
+                "Repeated verbatim inside every image prompt so the same person "
+                "appears in every frame. Describe build, face, hair and wardrobe — "
+                "these are the details image models actually act on."
+            ),
+        )
+
         lyrics = st.text_area(
             "Lyrics",
             height=320,
@@ -532,6 +572,7 @@ def main():
                             bible = generate_bible(
                                 client, title or "Untitled", artist or "Unknown Artist",
                                 lyrics, mood, style, colors,
+                                protagonist=protagonist,
                             )
 
                         with st.spinner("🎬 Directing your music video…"):

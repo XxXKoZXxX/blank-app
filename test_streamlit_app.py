@@ -997,6 +997,90 @@ class TestGetHfToken(unittest.TestCase):
         _st_stub.session_state["hf_token"] = "hf_session"
         self.assertEqual(streamlit_app.get_hf_token(), "hf_session")
 
+# ---------------------------------------------------------------------------
+# Casting override
+# ---------------------------------------------------------------------------
+
+class TestCastingContext(unittest.TestCase):
+    def test_empty_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context(""), "")
+
+    def test_none_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context(None), "")
+
+    def test_whitespace_only_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context("   \n  "), "")
+
+    def test_includes_the_description(self):
+        ctx = streamlit_app._casting_context("Early-30s man, black snapback")
+        self.assertIn("Early-30s man, black snapback", ctx)
+
+    def test_marks_casting_as_fixed(self):
+        ctx = streamlit_app._casting_context("someone")
+        self.assertIn("do not invent", ctx.lower())
+
+    def test_strips_surrounding_whitespace(self):
+        ctx = streamlit_app._casting_context("  a person  ")
+        self.assertIn("cast: a person", ctx)
+
+
+class TestGenerateBibleCasting(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.messages.create.return_value = _make_mock_response(
+            json.dumps(SAMPLE_BIBLE)
+        )
+
+    def test_casting_prepended_to_prompt(self):
+        streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C",
+            protagonist="Lean man in a black snapback",
+        )
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("Lean man in a black snapback", kwargs["messages"][0]["content"])
+
+    def test_casting_precedes_the_bible_template(self):
+        streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist="somebody",
+        )
+        _, kwargs = self.client.messages.create.call_args
+        content = kwargs["messages"][0]["content"]
+        self.assertLess(content.index("CASTING"), content.index("Design the visual identity"))
+
+    def test_override_wins_over_model_output(self):
+        """Whatever the model returns, the chosen casting is what ships."""
+        chosen = "Early-30s man, angular face, black graphic hoodie"
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist=chosen,
+        )
+        self.assertEqual(bible["protagonist"], chosen)
+        self.assertNotEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_without_override_model_output_is_kept(self):
+        bible = streamlit_app.generate_bible(self.client, "T", "A", "L", "M", "S", "C")
+        self.assertEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_blank_override_does_not_replace_model_output(self):
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist="   ",
+        )
+        self.assertEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_no_casting_block_when_absent(self):
+        streamlit_app.generate_bible(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertNotIn("CASTING", kwargs["messages"][0]["content"])
+
+    def test_override_reaches_scene_prompts(self):
+        """The override must survive into the per-scene image prompts, which is
+        the whole point of locking casting."""
+        chosen = "Early-30s man, black snapback worn straight"
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist=chosen,
+        )
+        ctx = streamlit_app._bible_context(bible)
+        self.assertIn(chosen, ctx)
+
 
 if __name__ == "__main__":
     unittest.main()
