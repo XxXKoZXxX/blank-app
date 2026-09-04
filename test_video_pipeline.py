@@ -427,6 +427,82 @@ class TestAssembleIntegration(unittest.TestCase):
         vp.assemble(self.clips, out)
         self.assertFalse(os.path.exists(out + ".concat.txt"))
 
+# ---------------------------------------------------------------------------
+# build_shot_list
+# ---------------------------------------------------------------------------
+
+SHOT_SCENES = [
+    {"section": "Verse 1", "camera": "Slow push-in", "duration_sec": 37},
+    {"section": "Hook", "camera": "Locked-off", "duration_sec": 30},
+    {"section": "Empty", "camera": "pan", "duration_sec": 10},
+]
+
+
+class TestBuildShotList(unittest.TestCase):
+    def _shots(self, mapping=None, **kw):
+        return vp.build_shot_list(
+            SHOT_SCENES, mapping if mapping is not None else {0: [b"a", b"b", b"c"], 1: [b"d", b"e"]}, **kw
+        )
+
+    def test_flattens_to_one_entry_per_frame(self):
+        self.assertEqual(len(self._shots()), 5)
+
+    def test_scene_duration_is_split_evenly(self):
+        shots = self._shots()
+        hook = [s for s in shots if s["scene_index"] == 1]
+        self.assertEqual([s["duration"] for s in hook], [15.0, 15.0])
+
+    def test_durations_still_total_the_scene(self):
+        """Rounding remainder goes to the last shot so the scene lands on its mark."""
+        shots = self._shots()
+        for index, expected in ((0, 37.0), (1, 30.0)):
+            total = sum(s["duration"] for s in shots if s["scene_index"] == index)
+            self.assertAlmostEqual(total, expected, places=3)
+
+    def test_scenes_without_frames_are_skipped(self):
+        shots = self._shots()
+        self.assertFalse(any(s["scene_index"] == 2 for s in shots))
+
+    def test_motion_alternates_within_a_scene(self):
+        shots = [s for s in self._shots() if s["scene_index"] == 0]
+        self.assertEqual([s["motion"] for s in shots],
+                         ["push_in", "pull_back", "push_in"])
+
+    def test_static_scenes_stay_static_when_alternating(self):
+        shots = [s for s in self._shots() if s["scene_index"] == 1]
+        self.assertEqual({s["motion"] for s in shots}, {"static"})
+
+    def test_alternation_can_be_disabled(self):
+        shots = [s for s in self._shots(alternate=False) if s["scene_index"] == 0]
+        self.assertEqual({s["motion"] for s in shots}, {"push_in"})
+
+    def test_single_frame_scene_takes_the_whole_duration(self):
+        shots = vp.build_shot_list(SHOT_SCENES, {1: [b"only"]})
+        self.assertEqual(shots[0]["duration"], 30.0)
+
+    def test_carries_section_and_indices(self):
+        shot = self._shots()[0]
+        self.assertEqual(shot["section"], "Verse 1")
+        self.assertEqual(shot["scene_index"], 0)
+        self.assertEqual(shot["shot_index"], 0)
+
+    def test_image_bytes_preserved_in_order(self):
+        shots = [s for s in self._shots() if s["scene_index"] == 0]
+        self.assertEqual([s["image"] for s in shots], [b"a", b"b", b"c"])
+
+    def test_empty_mapping_yields_no_shots(self):
+        self.assertEqual(vp.build_shot_list(SHOT_SCENES, {}), [])
+
+    def test_zero_duration_scene_yields_zero_durations(self):
+        scenes = [{"section": "X", "camera": "push", "duration_sec": 0}]
+        shots = vp.build_shot_list(scenes, {0: [b"a", b"b"]})
+        self.assertEqual([s["duration"] for s in shots], [0.0, 0.0])
+
+    def test_many_shots_in_one_scene(self):
+        shots = vp.build_shot_list(SHOT_SCENES, {1: [b"x"] * 10})
+        self.assertEqual(len(shots), 10)
+        self.assertAlmostEqual(sum(s["duration"] for s in shots), 30.0, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,6 +129,60 @@ def apply_timestamp_map(scenes, marks, total_seconds=None):
     return out
 
 
+# A scene rendered as several consecutive shots looks mechanical if every shot
+# carries the identical move, so alternating shots take the opposite one.
+COMPLEMENT_MOTION = {
+    "push_in": "pull_back",
+    "pull_back": "push_in",
+    "drift_left": "drift_right",
+    "drift_right": "drift_left",
+    "static": "static",
+}
+
+
+def build_shot_list(scenes, shots_by_scene, alternate=True):
+    """Flatten scenes into individual shots.
+
+    A music video cuts far more often than it changes scene, so each scene may
+    hold several frames. `shots_by_scene` maps a scene index to that scene's
+    frames in order; the scene's duration is split evenly between them, with
+    any rounding remainder given to the last shot so the scene still totals
+    exactly what the storyboard said.
+
+    Scenes with no frames are skipped rather than leaving a gap in the cut.
+    """
+    shots = []
+    for index, scene in enumerate(scenes):
+        frames = shots_by_scene.get(index) or []
+        if not frames:
+            continue
+
+        total = float(scene.get("duration_sec") or 0)
+        base = infer_motion(scene.get("camera", ""))
+        count = len(frames)
+        each = round(total / count, 3) if total > 0 else 0.0
+
+        for position, frame in enumerate(frames):
+            motion = base
+            if alternate and position % 2 == 1:
+                motion = COMPLEMENT_MOTION.get(base, base)
+
+            duration = each
+            if position == count - 1 and total > 0:
+                # absorb the rounding remainder so the scene lands on its mark
+                duration = round(total - each * (count - 1), 3)
+
+            shots.append({
+                "scene_index": index,
+                "shot_index": position,
+                "section": scene.get("section", ""),
+                "duration": duration,
+                "motion": motion,
+                "image": frame,
+            })
+    return shots
+
+
 # ---------------------------------------------------------------------------
 # Ken Burns
 # ---------------------------------------------------------------------------
