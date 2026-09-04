@@ -6,7 +6,13 @@ import os
 import re
 import tempfile
 
+import project_store as ps
 import video_pipeline as vp
+
+PROJECTS_ROOT = os.environ.get(
+    "MVS_PROJECTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects"),
+)
 
 MODEL = "claude-opus-5"
 
@@ -545,6 +551,12 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
+    studio = ps.load_studio(PROJECTS_ROOT)
+    if "protagonist_ref" not in st.session_state:
+        stored_ref = ps.load_reference(PROJECTS_ROOT)
+        if stored_ref:
+            st.session_state["protagonist_ref"] = stored_ref
+
     st.title("🎬 Music Video Studio")
     st.caption("Drop in lyrics — get a full cinematic storyboard, consistent characters, and rendered frames.")
 
@@ -574,6 +586,67 @@ def main():
         st.session_state["image_model"] = IMAGE_MODELS[image_model_label]
 
         st.divider()
+        st.subheader("📁 Projects")
+
+        rows = ps.list_projects(PROJECTS_ROOT)
+        labels = ["— New project —"] + [
+            f"{r['title']} · {r['scene_count']} scenes, {r['frame_count']} frames"
+            for r in rows
+        ]
+        choice = st.selectbox("Saved", labels, label_visibility="collapsed")
+
+        if choice != labels[0]:
+            row = rows[labels.index(choice) - 1]
+            load_col, del_col = st.columns(2)
+            with load_col:
+                if st.button("Load", use_container_width=True):
+                    data = ps.load_project(PROJECTS_ROOT, row["slug"])
+                    if data:
+                        st.session_state["scenes"] = data.get("scenes") or []
+                        st.session_state["bible"] = data.get("bible") or {}
+                        st.session_state["meta"] = data.get("meta") or {}
+                        st.session_state["images"] = data.get("images") or {}
+                        st.session_state["saved_timestamps"] = data.get("timestamps", "")
+                        st.success(f"Loaded {row['title']}")
+                        st.rerun()
+                    else:
+                        st.error("That project could not be read.")
+            with del_col:
+                if st.button("Delete", use_container_width=True):
+                    ps.delete_project(PROJECTS_ROOT, row["slug"])
+                    st.rerun()
+
+        if st.session_state.get("scenes"):
+            if st.button("💾 Save project", type="primary", use_container_width=True):
+                meta = st.session_state.get("meta", {})
+                ps.save_project(
+                    PROJECTS_ROOT,
+                    meta.get("title") or "Untitled",
+                    meta=meta,
+                    bible=st.session_state.get("bible"),
+                    scenes=st.session_state.get("scenes"),
+                    images=st.session_state.get("images", {}),
+                    timestamps=st.session_state.get("saved_timestamps", ""),
+                )
+                ps.remember(
+                    PROJECTS_ROOT,
+                    artist=meta.get("artist"),
+                    style=meta.get("style"),
+                    mood=meta.get("mood"),
+                    protagonist=st.session_state.get("protagonist_desc"),
+                )
+                if st.session_state.get("protagonist_ref"):
+                    ps.save_reference(PROJECTS_ROOT, st.session_state["protagonist_ref"])
+                st.success("Saved — frames and all.")
+                st.rerun()
+
+        if studio:
+            remembered = [k for k in ("artist", "protagonist", "style", "mood")
+                          if studio.get(k)]
+            if remembered:
+                st.caption("Remembered: " + ", ".join(remembered))
+
+        st.divider()
         st.markdown("**How it works:**")
         st.markdown("1. Paste your lyrics")
         st.markdown("2. Claude writes a visual bible")
@@ -592,10 +665,22 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input("Song Title", placeholder="Midnight Static")
-            artist = st.text_input("Artist / Band", placeholder="Your artist name")
-            mood = st.selectbox("Mood / Vibe", MOOD_OPTIONS)
+            artist = st.text_input(
+                "Artist / Band",
+                value=studio.get("artist", ""),
+                placeholder="Your artist name",
+            )
+            mood = st.selectbox(
+                "Mood / Vibe", MOOD_OPTIONS,
+                index=(MOOD_OPTIONS.index(studio["mood"])
+                       if studio.get("mood") in MOOD_OPTIONS else 0),
+            )
         with c2:
-            style = st.selectbox("Visual Style", VISUAL_STYLES)
+            style = st.selectbox(
+                "Visual Style", VISUAL_STYLES,
+                index=(VISUAL_STYLES.index(studio["style"])
+                       if studio.get("style") in VISUAL_STYLES else 0),
+            )
             colors = st.text_input(
                 "Color Palette (optional)",
                 placeholder="deep indigo, electric gold, midnight black",
@@ -608,6 +693,7 @@ def main():
 
         protagonist = st.text_area(
             "Protagonist (optional)",
+            value=studio.get("protagonist", ""),
             height=90,
             placeholder=(
                 "Who are we following? e.g. \"Early-30s man, lean angular face, "
@@ -620,6 +706,8 @@ def main():
                 "these are the details image models actually act on."
             ),
         )
+
+        st.session_state["protagonist_desc"] = protagonist
 
         ref_photo = st.file_uploader(
             "Protagonist reference photo (optional)",
