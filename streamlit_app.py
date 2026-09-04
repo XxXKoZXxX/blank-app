@@ -6,7 +6,13 @@ import os
 import re
 import tempfile
 
+import project_store as ps
 import video_pipeline as vp
+
+PROJECTS_ROOT = os.environ.get(
+    "MVS_PROJECTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects"),
+)
 
 MODEL = "claude-opus-5"
 
@@ -15,6 +21,11 @@ IMAGE_MODELS = {
     "FLUX.1 dev (higher quality)": "black-forest-labs/FLUX.1-dev",
     "Stable Diffusion 3.5 Large": "stabilityai/stable-diffusion-3.5-large",
 }
+
+# Used only when a protagonist reference photo is supplied. Kontext is an
+# image-editing model: it takes the reference plus a prompt and re-stages the
+# same person, which plain text-to-image cannot do.
+REFERENCE_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 
 HF_ENDPOINT = "https://router.huggingface.co/hf-inference/models/{model}"
 
@@ -199,13 +210,38 @@ def _call(client, prompt, max_tokens=8192):
     return response.content[0].text
 
 
-def generate_bible(client, title, artist, lyrics, mood, style, colors):
-    """Generate the visual bible that keeps every frame consistent."""
-    prompt = BIBLE_PROMPT.format(
+def _casting_context(protagonist):
+    """Prompt prefix that locks an already-cast protagonist.
+
+    Kept out of BIBLE_PROMPT so that template keeps its fixed placeholder set
+    and stays formattable on its own.
+    """
+    if not protagonist or not protagonist.strip():
+        return ""
+    return (
+        "--- CASTING (already decided, do not invent an alternative) ---\n"
+        f"The protagonist is cast: {protagonist.strip()}\n"
+        "Treat this as fixed. Build the wardrobe, locations, palette and motifs "
+        "around this person instead of proposing someone else.\n"
+        "---\n\n"
+    )
+
+
+def generate_bible(client, title, artist, lyrics, mood, style, colors,
+                   protagonist=None):
+    """Generate the visual bible that keeps every frame consistent.
+
+    A protagonist passed here overrides whatever the model returns, so the
+    casting the user chose is what reaches every downstream image prompt.
+    """
+    prompt = _casting_context(protagonist) + BIBLE_PROMPT.format(
         title=title, artist=artist, lyrics=lyrics,
         mood=mood, style=style, colors=colors or "derived from mood and style",
     )
-    return _extract_json(_call(client, prompt, max_tokens=2048))
+    bible = _extract_json(_call(client, prompt, max_tokens=2048))
+    if protagonist and protagonist.strip():
+        bible["protagonist"] = protagonist.strip()
+    return bible
 
 
 def _bible_context(bible):
@@ -274,6 +310,73 @@ def generate_image(token, prompt, model="black-forest-labs/FLUX.1-schnell"):
         return None, messages[response.status_code]
 
     return None, f"HTTP {response.status_code}: {response.text[:200]}"
+
+
+def generate_image_from_reference(token, reference_bytes, prompt,
+                                 model=REFERENCE_MODEL):
+    """Render a frame that keeps the protagonist's likeness.
+
+    Sends the reference photo plus the scene prompt to an image-editing model,
+    which re-stages that person in the described setting. Identity carries far
+    better than any text description can manage, though it is a likeness rather
+    than a photographic match.
+
+    Returns (image_bytes, None) or (None, error_message).
+    """
+    if not token:
+        return None, "No Hugging Face token — add one in the sidebar."
+    if not reference_bytes:
+        return None, "No reference photo supplied."
+
+    import base64
+
+    payload = {
+        "inputs": base64.b64encode(reference_bytes).decode("ascii"),
+        "parameters": {"prompt": prompt},
+    }
+    try:
+        response = requests.post(
+            HF_ENDPOINT.format(model=model),
+            headers={"Authorization": f"Bearer {token}", "Accept": "image/png"},
+            json=payload,
+            timeout=180,
+        )
+    except requests.exceptions.Timeout:
+        return None, "Timed out after 180s — reference rendering is slower."
+    except requests.exceptions.RequestException as e:
+        return None, f"Network error: {e}"
+
+    if response.status_code == 200:
+        return response.content, None
+
+    messages = {
+        401: "Invalid Hugging Face token.",
+        402: "Hugging Face credits exhausted for this account.",
+        404: (f"No serverless image-editing endpoint for {model}. "
+              "Clear the reference photo to fall back to text-to-image."),
+        503: "Model is loading on Hugging Face — retry in ~30s.",
+    }
+    if response.status_code in messages:
+        return None, messages[response.status_code]
+
+    return None, f"HTTP {response.status_code}: {response.text[:200]}"
+
+
+def render_frame(token, prompt, model, reference_bytes=None):
+    """Render one frame, using the protagonist reference when there is one.
+
+    Falls back to text-to-image if reference rendering fails, so a missing
+    Kontext endpoint degrades to a working frame rather than no frame.
+    """
+    if reference_bytes:
+        data, err = generate_image_from_reference(token, reference_bytes, prompt)
+        if data:
+            return data, None
+        fallback, fb_err = generate_image(token, prompt, model)
+        if fallback:
+            return fallback, f"reference render failed ({err}) — used text-to-image"
+        return None, f"{err}; fallback also failed: {fb_err}"
+    return generate_image(token, prompt, model)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +551,12 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
+    studio = ps.load_studio(PROJECTS_ROOT)
+    if "protagonist_ref" not in st.session_state:
+        stored_ref = ps.load_reference(PROJECTS_ROOT)
+        if stored_ref:
+            st.session_state["protagonist_ref"] = stored_ref
+
     st.title("🎬 Music Video Studio")
     st.caption("Drop in lyrics — get a full cinematic storyboard, consistent characters, and rendered frames.")
 
@@ -477,6 +586,67 @@ def main():
         st.session_state["image_model"] = IMAGE_MODELS[image_model_label]
 
         st.divider()
+        st.subheader("📁 Projects")
+
+        rows = ps.list_projects(PROJECTS_ROOT)
+        labels = ["— New project —"] + [
+            f"{r['title']} · {r['scene_count']} scenes, {r['frame_count']} frames"
+            for r in rows
+        ]
+        choice = st.selectbox("Saved", labels, label_visibility="collapsed")
+
+        if choice != labels[0]:
+            row = rows[labels.index(choice) - 1]
+            load_col, del_col = st.columns(2)
+            with load_col:
+                if st.button("Load", use_container_width=True):
+                    data = ps.load_project(PROJECTS_ROOT, row["slug"])
+                    if data:
+                        st.session_state["scenes"] = data.get("scenes") or []
+                        st.session_state["bible"] = data.get("bible") or {}
+                        st.session_state["meta"] = data.get("meta") or {}
+                        st.session_state["images"] = data.get("images") or {}
+                        st.session_state["saved_timestamps"] = data.get("timestamps", "")
+                        st.success(f"Loaded {row['title']}")
+                        st.rerun()
+                    else:
+                        st.error("That project could not be read.")
+            with del_col:
+                if st.button("Delete", use_container_width=True):
+                    ps.delete_project(PROJECTS_ROOT, row["slug"])
+                    st.rerun()
+
+        if st.session_state.get("scenes"):
+            if st.button("💾 Save project", type="primary", use_container_width=True):
+                meta = st.session_state.get("meta", {})
+                ps.save_project(
+                    PROJECTS_ROOT,
+                    meta.get("title") or "Untitled",
+                    meta=meta,
+                    bible=st.session_state.get("bible"),
+                    scenes=st.session_state.get("scenes"),
+                    images=st.session_state.get("images", {}),
+                    timestamps=st.session_state.get("saved_timestamps", ""),
+                )
+                ps.remember(
+                    PROJECTS_ROOT,
+                    artist=meta.get("artist"),
+                    style=meta.get("style"),
+                    mood=meta.get("mood"),
+                    protagonist=st.session_state.get("protagonist_desc"),
+                )
+                if st.session_state.get("protagonist_ref"):
+                    ps.save_reference(PROJECTS_ROOT, st.session_state["protagonist_ref"])
+                st.success("Saved — frames and all.")
+                st.rerun()
+
+        if studio:
+            remembered = [k for k in ("artist", "protagonist", "style", "mood")
+                          if studio.get(k)]
+            if remembered:
+                st.caption("Remembered: " + ", ".join(remembered))
+
+        st.divider()
         st.markdown("**How it works:**")
         st.markdown("1. Paste your lyrics")
         st.markdown("2. Claude writes a visual bible")
@@ -495,10 +665,22 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input("Song Title", placeholder="Midnight Static")
-            artist = st.text_input("Artist / Band", placeholder="Your artist name")
-            mood = st.selectbox("Mood / Vibe", MOOD_OPTIONS)
+            artist = st.text_input(
+                "Artist / Band",
+                value=studio.get("artist", ""),
+                placeholder="Your artist name",
+            )
+            mood = st.selectbox(
+                "Mood / Vibe", MOOD_OPTIONS,
+                index=(MOOD_OPTIONS.index(studio["mood"])
+                       if studio.get("mood") in MOOD_OPTIONS else 0),
+            )
         with c2:
-            style = st.selectbox("Visual Style", VISUAL_STYLES)
+            style = st.selectbox(
+                "Visual Style", VISUAL_STYLES,
+                index=(VISUAL_STYLES.index(studio["style"])
+                       if studio.get("style") in VISUAL_STYLES else 0),
+            )
             colors = st.text_input(
                 "Color Palette (optional)",
                 placeholder="deep indigo, electric gold, midnight black",
@@ -508,6 +690,50 @@ def main():
                 placeholder="3:45",
                 help="Scene durations are scaled to match your actual track.",
             )
+
+        protagonist = st.text_area(
+            "Protagonist (optional)",
+            value=studio.get("protagonist", ""),
+            height=90,
+            placeholder=(
+                "Who are we following? e.g. \"Early-30s man, lean angular face, "
+                "light stubble, black snapback worn straight, black graphic hoodie.\" "
+                "Leave blank and one gets invented for you."
+            ),
+            help=(
+                "Repeated verbatim inside every image prompt so the same person "
+                "appears in every frame. Describe build, face, hair and wardrobe — "
+                "these are the details image models actually act on."
+            ),
+        )
+
+        st.session_state["protagonist_desc"] = protagonist
+
+        ref_photo = st.file_uploader(
+            "Protagonist reference photo (optional)",
+            type=["png", "jpg", "jpeg", "webp"],
+            help=(
+                "A clear photo of the person. Frames are then rendered by an "
+                "image-editing model that re-stages this person in each scene, "
+                "so their likeness carries across the whole video. Expect a "
+                "strong likeness, not a photographic match."
+            ),
+        )
+        if ref_photo is not None:
+            st.session_state["protagonist_ref"] = ref_photo.getvalue()
+        if st.session_state.get("protagonist_ref"):
+            ref_cols = st.columns([1, 4])
+            with ref_cols[0]:
+                st.image(st.session_state["protagonist_ref"], width=110)
+            with ref_cols[1]:
+                st.caption(
+                    "Casting locked to this photo. Frames render through "
+                    f"`{REFERENCE_MODEL}`, falling back to text-to-image if "
+                    "that endpoint is unavailable."
+                )
+                if st.button("Clear reference photo"):
+                    st.session_state.pop("protagonist_ref", None)
+                    st.rerun()
 
         lyrics = st.text_area(
             "Lyrics",
@@ -532,6 +758,7 @@ def main():
                             bible = generate_bible(
                                 client, title or "Untitled", artist or "Unknown Artist",
                                 lyrics, mood, style, colors,
+                                protagonist=protagonist,
                             )
 
                         with st.spinner("🎬 Directing your music video…"):
@@ -606,7 +833,10 @@ def main():
 
                 for i, s in enumerate(scenes):
                     status.text(f"Rendering scene {i + 1} of {len(scenes)} — {s.get('section', '')}")
-                    data, err = generate_image(token, s.get("image_prompt", ""), model)
+                    data, err = render_frame(
+                        token, s.get("image_prompt", ""), model,
+                        reference_bytes=st.session_state.get("protagonist_ref"),
+                    )
                     if data:
                         images[i] = data
                     else:
@@ -645,7 +875,10 @@ def main():
                     st.markdown(f"**Scene {i + 1} — {s.get('section', '')}**")
                     if st.button("🔄 Render", key=f"render_{i}", disabled=not token):
                         with st.spinner("Rendering…"):
-                            data, err = generate_image(token, s.get("image_prompt", ""), model)
+                            data, err = render_frame(
+                                token, s.get("image_prompt", ""), model,
+                                reference_bytes=st.session_state.get("protagonist_ref"),
+                            )
                         if data:
                             images[i] = data
                             st.session_state["images"] = images

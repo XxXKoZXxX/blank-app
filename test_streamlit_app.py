@@ -997,6 +997,196 @@ class TestGetHfToken(unittest.TestCase):
         _st_stub.session_state["hf_token"] = "hf_session"
         self.assertEqual(streamlit_app.get_hf_token(), "hf_session")
 
+# ---------------------------------------------------------------------------
+# Casting override
+# ---------------------------------------------------------------------------
+
+class TestCastingContext(unittest.TestCase):
+    def test_empty_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context(""), "")
+
+    def test_none_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context(None), "")
+
+    def test_whitespace_only_returns_empty_string(self):
+        self.assertEqual(streamlit_app._casting_context("   \n  "), "")
+
+    def test_includes_the_description(self):
+        ctx = streamlit_app._casting_context("Early-30s man, black snapback")
+        self.assertIn("Early-30s man, black snapback", ctx)
+
+    def test_marks_casting_as_fixed(self):
+        ctx = streamlit_app._casting_context("someone")
+        self.assertIn("do not invent", ctx.lower())
+
+    def test_strips_surrounding_whitespace(self):
+        ctx = streamlit_app._casting_context("  a person  ")
+        self.assertIn("cast: a person", ctx)
+
+
+class TestGenerateBibleCasting(unittest.TestCase):
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.messages.create.return_value = _make_mock_response(
+            json.dumps(SAMPLE_BIBLE)
+        )
+
+    def test_casting_prepended_to_prompt(self):
+        streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C",
+            protagonist="Lean man in a black snapback",
+        )
+        _, kwargs = self.client.messages.create.call_args
+        self.assertIn("Lean man in a black snapback", kwargs["messages"][0]["content"])
+
+    def test_casting_precedes_the_bible_template(self):
+        streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist="somebody",
+        )
+        _, kwargs = self.client.messages.create.call_args
+        content = kwargs["messages"][0]["content"]
+        self.assertLess(content.index("CASTING"), content.index("Design the visual identity"))
+
+    def test_override_wins_over_model_output(self):
+        """Whatever the model returns, the chosen casting is what ships."""
+        chosen = "Early-30s man, angular face, black graphic hoodie"
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist=chosen,
+        )
+        self.assertEqual(bible["protagonist"], chosen)
+        self.assertNotEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_without_override_model_output_is_kept(self):
+        bible = streamlit_app.generate_bible(self.client, "T", "A", "L", "M", "S", "C")
+        self.assertEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_blank_override_does_not_replace_model_output(self):
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist="   ",
+        )
+        self.assertEqual(bible["protagonist"], SAMPLE_BIBLE["protagonist"])
+
+    def test_no_casting_block_when_absent(self):
+        streamlit_app.generate_bible(self.client, "T", "A", "L", "M", "S", "C")
+        _, kwargs = self.client.messages.create.call_args
+        self.assertNotIn("CASTING", kwargs["messages"][0]["content"])
+
+    def test_override_reaches_scene_prompts(self):
+        """The override must survive into the per-scene image prompts, which is
+        the whole point of locking casting."""
+        chosen = "Early-30s man, black snapback worn straight"
+        bible = streamlit_app.generate_bible(
+            self.client, "T", "A", "L", "M", "S", "C", protagonist=chosen,
+        )
+        ctx = streamlit_app._bible_context(bible)
+        self.assertIn(chosen, ctx)
+
+# ---------------------------------------------------------------------------
+# Reference-conditioned rendering
+# ---------------------------------------------------------------------------
+
+class TestGenerateImageFromReference(unittest.TestCase):
+    def test_no_token(self):
+        data, err = streamlit_app.generate_image_from_reference("", b"img", "p")
+        self.assertIsNone(data)
+        self.assertIn("token", err.lower())
+
+    def test_no_reference_bytes(self):
+        data, err = streamlit_app.generate_image_from_reference("tok", b"", "p")
+        self.assertIsNone(data)
+        self.assertIn("reference", err.lower())
+
+    def test_success_returns_bytes(self):
+        with patch("streamlit_app.requests.post") as post:
+            post.return_value = _make_http_response(200, content=b"PNG")
+            data, err = streamlit_app.generate_image_from_reference("tok", b"img", "p")
+        self.assertEqual(data, b"PNG")
+        self.assertIsNone(err)
+
+    def test_reference_sent_base64_encoded(self):
+        import base64
+        with patch("streamlit_app.requests.post") as post:
+            post.return_value = _make_http_response(200, content=b"PNG")
+            streamlit_app.generate_image_from_reference("tok", b"REFBYTES", "p")
+        _, kwargs = post.call_args
+        self.assertEqual(
+            kwargs["json"]["inputs"], base64.b64encode(b"REFBYTES").decode("ascii")
+        )
+
+    def test_prompt_sent_as_parameter(self):
+        with patch("streamlit_app.requests.post") as post:
+            post.return_value = _make_http_response(200, content=b"PNG")
+            streamlit_app.generate_image_from_reference("tok", b"img", "neon street")
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs["json"]["parameters"]["prompt"], "neon street")
+
+    def test_uses_the_reference_model_by_default(self):
+        with patch("streamlit_app.requests.post") as post:
+            post.return_value = _make_http_response(200, content=b"PNG")
+            streamlit_app.generate_image_from_reference("tok", b"img", "p")
+        args, _ = post.call_args
+        self.assertIn(streamlit_app.REFERENCE_MODEL, args[0])
+
+    def test_404_suggests_clearing_the_reference(self):
+        with patch("streamlit_app.requests.post") as post:
+            post.return_value = _make_http_response(404)
+            data, err = streamlit_app.generate_image_from_reference("tok", b"img", "p")
+        self.assertIsNone(data)
+        self.assertIn("Clear the reference", err)
+
+    def test_timeout_handled(self):
+        with patch("streamlit_app.requests.post") as post:
+            post.side_effect = streamlit_app.requests.exceptions.Timeout()
+            data, err = streamlit_app.generate_image_from_reference("tok", b"img", "p")
+        self.assertIsNone(data)
+        self.assertIn("imed out", err)
+
+
+class TestRenderFrame(unittest.TestCase):
+    def test_without_reference_uses_text_to_image(self):
+        with patch("streamlit_app.generate_image") as t2i, \
+             patch("streamlit_app.generate_image_from_reference") as ref:
+            t2i.return_value = (b"T2I", None)
+            data, err = streamlit_app.render_frame("tok", "p", "some/model")
+        self.assertEqual(data, b"T2I")
+        self.assertIsNone(err)
+        ref.assert_not_called()
+
+    def test_with_reference_prefers_reference_path(self):
+        with patch("streamlit_app.generate_image") as t2i, \
+             patch("streamlit_app.generate_image_from_reference") as ref:
+            ref.return_value = (b"REF", None)
+            data, err = streamlit_app.render_frame("tok", "p", "some/model",
+                                                   reference_bytes=b"photo")
+        self.assertEqual(data, b"REF")
+        self.assertIsNone(err)
+        t2i.assert_not_called()
+
+    def test_reference_failure_falls_back_to_text_to_image(self):
+        """A missing Kontext endpoint should still yield a frame."""
+        with patch("streamlit_app.generate_image") as t2i, \
+             patch("streamlit_app.generate_image_from_reference") as ref:
+            ref.return_value = (None, "404 no endpoint")
+            t2i.return_value = (b"T2I", None)
+            data, err = streamlit_app.render_frame("tok", "p", "some/model",
+                                                   reference_bytes=b"photo")
+        self.assertEqual(data, b"T2I")
+        self.assertIn("used text-to-image", err)
+
+    def test_both_paths_failing_reports_both(self):
+        with patch("streamlit_app.generate_image") as t2i, \
+             patch("streamlit_app.generate_image_from_reference") as ref:
+            ref.return_value = (None, "ref boom")
+            t2i.return_value = (None, "t2i boom")
+            data, err = streamlit_app.render_frame("tok", "p", "some/model",
+                                                   reference_bytes=b"photo")
+        self.assertIsNone(data)
+        self.assertIn("ref boom", err)
+        self.assertIn("t2i boom", err)
+
+    def test_reference_model_is_an_editing_model(self):
+        self.assertIn("Kontext", streamlit_app.REFERENCE_MODEL)
+
 
 if __name__ == "__main__":
     unittest.main()
